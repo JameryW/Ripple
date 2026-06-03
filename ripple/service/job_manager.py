@@ -13,14 +13,16 @@ from .event_bus import EventBus
 from .job_repo_sqlite import JobRepoSQLite
 from .runner import run_simulation_with_progress
 
-RunSimulationFn = Callable[[dict, Callable[[SimulationEvent], Awaitable[None]]], Awaitable[dict]]
+RunSimulationFn = Callable[
+    [dict, Callable[[SimulationEvent], Awaitable[None]]], Awaitable[dict]
+]
 
 
 class JobManager:
     def __init__(
         self,
         db_path: str | Path,
-        output_dir: str | Path = 'ripple_outputs',
+        output_dir: str | Path = "ripple_outputs",
         run_simulation: RunSimulationFn = run_simulation_with_progress,
     ):
         self.repo = JobRepoSQLite(db_path=db_path)
@@ -43,12 +45,14 @@ class JobManager:
     async def create_job(self, request: dict) -> str:
         normalized_request = dict(request)
         job_id = f"job_{uuid.uuid4().hex[:12]}"
-        normalized_request['output_path'] = self._prepare_output_dir(
-            normalized_request.get('output_path'),
+        normalized_request["output_path"] = self._prepare_output_dir(
+            normalized_request.get("output_path"),
             job_id,
         )
         self.repo.create_job(job_id, normalized_request)
-        self._tasks[job_id] = asyncio.create_task(self._execute(job_id=job_id, request=normalized_request))
+        self._tasks[job_id] = asyncio.create_task(
+            self._execute(job_id=job_id, request=normalized_request)
+        )
         return job_id
 
     async def _on_progress(self, job_id: str, event: SimulationEvent) -> None:
@@ -69,13 +73,28 @@ class JobManager:
         self.repo.update_status(job_id, "running")
         await self.event_bus.publish(job_id, "job.started", {"phase": "INIT"})
         try:
-            result = await self._run_simulation(request, lambda ev: self._on_progress(job_id, ev))
-            self.repo.set_result(job_id, result)
-            self.repo.update_status(job_id, "completed")
-            await self.event_bus.publish(job_id, "job.completed", result)
+            result = await self._run_simulation(
+                request, lambda ev: self._on_progress(job_id, ev)
+            )
+            # Check if simulation timed out (runtime.run() catches TimeoutError internally)
+            if result.get("timed_out"):
+                err = {
+                    "code": "timeout",
+                    "message": result.get("prediction", {}).get("error", "Job timed out"),
+                    "timeout_phase": result.get("timeout_phase"),
+                }
+                self.repo.set_error(job_id, err)
+                self.repo.update_status(job_id, "timed_out")
+                await self.event_bus.publish(job_id, "job.timed_out", err)
+            else:
+                self.repo.set_result(job_id, result)
+                self.repo.update_status(job_id, "completed")
+                await self.event_bus.publish(job_id, "job.completed", result)
         except asyncio.CancelledError:
             self.repo.update_status(job_id, "cancelled")
-            await self.event_bus.publish(job_id, "job.cancelled", {"message": "cancelled"})
+            await self.event_bus.publish(
+                job_id, "job.cancelled", {"message": "cancelled"}
+            )
             raise
         except Exception as exc:  # pragma: no cover - safety path
             err = {"code": "simulation_error", "message": str(exc)}

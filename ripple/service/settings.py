@@ -11,13 +11,17 @@ class ServiceSettings(BaseModel):
     output_dir: str = "/data/ripple_outputs"
     llm_config_path: str = "/app/llm_config.yaml"
     cancel_ttl_seconds: int = 60
+    job_timeout: int = 1800  # Overall job timeout in seconds (default 30min)
 
     @classmethod
     def from_env(cls) -> "ServiceSettings":
         return cls(
             api_token=os.getenv("RIPPLE_API_TOKEN", ""),
-            db_path=os.getenv("RIPPLE_DB_PATH", "data/ripple-service/ripple_service.db"),
+            db_path=os.getenv(
+                "RIPPLE_DB_PATH", "data/ripple-service/ripple_service.db"
+            ),
             output_dir=os.getenv("RIPPLE_OUTPUT_DIR", "/data/ripple_outputs"),
             llm_config_path=os.getenv("RIPPLE_LLM_CONFIG_PATH", "/app/llm_config.yaml"),
             cancel_ttl_seconds=int(os.getenv("RIPPLE_CANCEL_TTL_SECONDS", "60")),
+            job_timeout=int(os.getenv("RIPPLE_JOB_TIMEOUT", "1800")),
         )

@@ -52,6 +52,7 @@ class AnthropicAdapter:
         timeout: float = 120.0,
         max_retries: int = 3,
         stream: bool = True,
+        json_mode: bool = False,
     ):
         """初始化适配器。 / Initialize adapter.
 
@@ -64,6 +65,7 @@ class AnthropicAdapter:
             timeout: 请求超时时间（秒）。 / Request timeout in seconds.
             max_retries: 最大重试次数。 / Max retry count.
             stream: 是否使用流式调用（SSE），默认 True。 / Whether to use streaming (SSE), default True.
+            json_mode: 是否启用 JSON 结构化输出模式。 / Whether to enable JSON structured output mode.
         """
         self._endpoint = self._resolve_endpoint(url)
         self._api_key = api_key
@@ -73,6 +75,7 @@ class AnthropicAdapter:
         self._timeout = timeout
         self._max_retries = max_retries
         self._stream = stream
+        self._json_mode = json_mode
 
     async def call(
         self,
@@ -110,9 +113,17 @@ class AnthropicAdapter:
         for attempt in range(self._max_retries + 1):
             try:
                 if self._stream:
-                    return await self._call_stream(headers, request_body)
+                    result = await self._call_stream(headers, request_body)
                 else:
-                    return await self._call_non_stream(headers, request_body)
+                    result = await self._call_non_stream(headers, request_body)
+
+                # Fix #3: When json_mode is active, the prefill "{\n" was consumed
+                # by the assistant prefill, so the response content starts after that.
+                # We need to prepend it back for valid JSON parsing.
+                if self._json_mode and result and not result.lstrip().startswith("{"):
+                    result = "{\n" + result
+
+                return result
 
             except httpx.HTTPStatusError as e:
                 last_error = e
@@ -155,7 +166,9 @@ class AnthropicAdapter:
         """非流式调用。 / Non-streaming call."""
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
-                self._endpoint, headers=headers, json=request_body,
+                self._endpoint,
+                headers=headers,
+                json=request_body,
             )
             response.raise_for_status()
             result = response.json()
@@ -172,12 +185,18 @@ class AnthropicAdapter:
           event: message_stop         →  结束 / end
         """
         stream_timeout = httpx.Timeout(
-            connect=30.0, read=self._timeout, write=30.0, pool=30.0,
+            connect=30.0,
+            read=self._timeout,
+            write=30.0,
+            pool=30.0,
         )
         chunks: List[str] = []
         async with httpx.AsyncClient(timeout=stream_timeout) as client:
             async with client.stream(
-                "POST", self._endpoint, headers=headers, json=request_body,
+                "POST",
+                self._endpoint,
+                headers=headers,
+                json=request_body,
             ) as response:
                 if response.is_error:
                     try:
@@ -188,13 +207,13 @@ class AnthropicAdapter:
                 event_type = ""
                 async for line in response.aiter_lines():
                     if line.startswith("event:"):
-                        event_type = line[len("event:"):].strip()
+                        event_type = line[len("event:") :].strip()
                         continue
                     if not line.startswith("data:"):
                         continue
                     if event_type == "message_stop":
                         break
-                    payload = line[len("data:"):].strip()
+                    payload = line[len("data:") :].strip()
                     try:
                         data = json.loads(payload)
                     except json.JSONDecodeError:
@@ -257,14 +276,24 @@ class AnthropicAdapter:
     # 请求构建与响应解析 / Request Building & Response Parsing
     # =========================================================================
 
-    def _build_request(
-        self, system_prompt: str, user_message: str
-    ) -> Dict[str, Any]:
-        """构建 Anthropic Messages API 请求体。 / Build Anthropic Messages API request body."""
+    def _build_request(self, system_prompt: str, user_message: str) -> Dict[str, Any]:
+        """构建 Anthropic Messages API 请求体。 / Build Anthropic Messages API request body.
+
+        Fix #3: When json_mode=True, appends a prefill assistant message with "\\n{"
+        to force JSON start (Anthropic doesn't support response_format natively).
+        """
+        messages: List[Dict[str, str]] = [
+            {"role": "user", "content": user_message},
+        ]
+
+        # Fix #3: JSON mode prefill — Anthropic uses assistant prefill to guide output format
+        if self._json_mode:
+            messages.append({"role": "assistant", "content": "\n{"})
+
         body: Dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": messages,
         }
 
         if system_prompt:
@@ -311,10 +340,10 @@ class AnthropicAdapter:
         """
         if not config.api_key:
             raise ValueError(
-                f"Anthropic API 模式需要显式配置 api_key，"
-                f"但角色的 api_key 为空。"
-                f"请在 llm_config 中设置 api_key 或通过环境变量 "
-                f"ANTHROPIC_API_KEY 提供。"
+                "Anthropic API 模式需要显式配置 api_key，"
+                "但角色的 api_key 为空。"
+                "请在 llm_config 中设置 api_key 或通过环境变量 "
+                "ANTHROPIC_API_KEY 提供。"
             )
 
         return cls(
@@ -326,4 +355,5 @@ class AnthropicAdapter:
             timeout=config.timeout or 120.0,
             max_retries=config.max_retries,
             stream=config.stream,
+            json_mode=getattr(config, "json_mode", False),
         )

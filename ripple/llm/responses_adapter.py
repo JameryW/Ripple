@@ -70,22 +70,21 @@ class ResponsesAPIAdapter:
         max_retries: int = 3,
         api_version: Optional[str] = None,
         stream: bool = True,
+        json_mode: bool = False,
     ):
         """初始化适配器。 / Initialize adapter.
 
         Args:
-            url: API 端点 URL / API endpoint URL. Supports:
-                 - 基础 URL / Base URL → auto-appends /responses
-                 - 完整 URL / Full URL → used as-is
-                 - 带参数 URL / URL with query params → preserved
+            url: API 端点 URL / API endpoint URL.
             api_key: API 密钥。 / API key.
-            model: 模型名称。 / Model name (e.g. "doubao-seed-1-6-flash-250828").
-            temperature: 生成温度；None 表示不发送该参数。 / Generation temperature; None means omit it.
+            model: 模型名称。 / Model name.
+            temperature: 生成温度。 / Generation temperature.
             max_tokens: 最大输出 token 数。 / Max output tokens.
             timeout: 请求超时时间（秒）。 / Request timeout in seconds.
             max_retries: 最大重试次数。 / Max retry count.
             api_version: Azure API 版本（可选）。 / Azure API version (optional).
-            stream: 是否使用流式调用（SSE），默认 True。 / Whether to use streaming (SSE), default True.
+            stream: 是否使用流式调用（SSE）。 / Whether to use streaming (SSE).
+            json_mode: 是否启用 JSON 结构化输出模式。 / Whether to enable JSON structured output mode.
         """
         self._endpoint = self._resolve_endpoint(url, api_version)
         self._is_azure = self._detect_azure(url)
@@ -97,6 +96,7 @@ class ResponsesAPIAdapter:
         self._timeout = timeout
         self._max_retries = max_retries
         self._stream = stream
+        self._json_mode = json_mode
 
         if self._is_azure:
             logger.info(
@@ -172,8 +172,7 @@ class ResponsesAPIAdapter:
                 )
 
         raise RuntimeError(
-            f"Responses API 调用在 {self._max_retries + 1} 次尝试后仍失败: "
-            f"{last_error}"
+            f"Responses API 调用在 {self._max_retries + 1} 次尝试后仍失败: {last_error}"
         )
 
     async def _call_non_stream(
@@ -182,7 +181,9 @@ class ResponsesAPIAdapter:
         """非流式调用。 / Non-streaming call."""
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
-                self._endpoint, headers=headers, json=request_body,
+                self._endpoint,
+                headers=headers,
+                json=request_body,
             )
             response.raise_for_status()
             result = response.json()
@@ -199,23 +200,29 @@ class ResponsesAPIAdapter:
           event: response.completed          →  结束 / end
         """
         stream_timeout = httpx.Timeout(
-            connect=30.0, read=self._timeout, write=30.0, pool=30.0,
+            connect=30.0,
+            read=self._timeout,
+            write=30.0,
+            pool=30.0,
         )
         chunks: List[str] = []
         async with httpx.AsyncClient(timeout=stream_timeout) as client:
             async with client.stream(
-                "POST", self._endpoint, headers=headers, json=request_body,
+                "POST",
+                self._endpoint,
+                headers=headers,
+                json=request_body,
             ) as response:
                 response.raise_for_status()
                 event_type = ""
                 async for line in response.aiter_lines():
                     # SSE 格式：event: xxx / data: xxx / 空行分隔
                     if line.startswith("event:"):
-                        event_type = line[len("event:"):].strip()
+                        event_type = line[len("event:") :].strip()
                         continue
                     if not line.startswith("data:"):
                         continue
-                    payload = line[len("data:"):].strip()
+                    payload = line[len("data:") :].strip()
                     if payload == "[DONE]":
                         break
                     try:
@@ -240,9 +247,7 @@ class ResponsesAPIAdapter:
     # =========================================================================
 
     @staticmethod
-    def _resolve_endpoint(
-        url: str, api_version: Optional[str] = None
-    ) -> str:
+    def _resolve_endpoint(url: str, api_version: Optional[str] = None) -> str:
         """智能解析端点 URL。 / Smartly resolve endpoint URL.
 
         处理逻辑 / Logic:
@@ -271,9 +276,7 @@ class ResponsesAPIAdapter:
         new_query = urlencode(query_params, doseq=True)
 
         # 重组 URL / Reassemble URL
-        resolved = urlunparse(
-            parsed._replace(path=path, query=new_query)
-        )
+        resolved = urlunparse(parsed._replace(path=path, query=new_query))
         return resolved
 
     @staticmethod
@@ -290,9 +293,7 @@ class ResponsesAPIAdapter:
     # 请求构建与响应解析 / Request Building & Response Parsing
     # =========================================================================
 
-    def _build_request(
-        self, system_prompt: str, user_message: str
-    ) -> Dict[str, Any]:
+    def _build_request(self, system_prompt: str, user_message: str) -> Dict[str, Any]:
         """构建 Responses API 请求体。 / Build Responses API request body.
 
         使用 instructions 字段传递系统提示词，input 数组传递用户消息。
@@ -319,6 +320,10 @@ class ResponsesAPIAdapter:
             body["temperature"] = self._temperature
         if self._max_tokens is not None:
             body["max_output_tokens"] = self._max_tokens
+
+        # Fix #3: Add response_format for JSON mode
+        if self._json_mode:
+            body["response_format"] = {"type": "json_object"}
 
         return body
 
@@ -385,14 +390,14 @@ class ResponsesAPIAdapter:
         """
         if not config.url:
             raise ValueError(
-                f"Responses API 模式需要显式配置 url，"
-                f"但角色的 url 为空。请在 llm_config 中设置 url。"
+                "Responses API 模式需要显式配置 url，"
+                "但角色的 url 为空。请在 llm_config 中设置 url。"
             )
         if not config.api_key:
             raise ValueError(
-                f"Responses API 模式需要显式配置 api_key，"
-                f"但角色的 api_key 为空。"
-                f"请在 llm_config 中设置 api_key 或通过环境变量提供。"
+                "Responses API 模式需要显式配置 api_key，"
+                "但角色的 api_key 为空。"
+                "请在 llm_config 中设置 api_key 或通过环境变量提供。"
             )
 
         return cls(
@@ -405,4 +410,5 @@ class ResponsesAPIAdapter:
             max_retries=config.max_retries,
             api_version=config.api_version,
             stream=config.stream,
+            json_mode=getattr(config, "json_mode", False),
         )

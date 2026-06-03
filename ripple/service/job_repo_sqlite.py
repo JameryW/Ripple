@@ -9,12 +9,13 @@ from typing import Any, Iterable, Optional
 
 ALLOWED_TRANSITIONS = {
     "queued": {"running", "failed", "cancelled"},
-    "running": {"completed", "failed", "cancel_pending", "cancelled"},
+    "running": {"completed", "failed", "cancel_pending", "cancelled", "timed_out"},
     "cancel_pending": {"cancelling", "running"},
     "cancelling": {"cancelled", "failed"},
     "completed": set(),
     "failed": set(),
     "cancelled": set(),
+    "timed_out": set(),
 }
 
 
@@ -184,7 +185,7 @@ class JobRepoSQLite:
         update_fields: dict[str, Any] = {"status": status}
         if status == "running" and not self.get_job(job_id).get("started_at"):
             update_fields["started_at"] = self._utcnow_iso()
-        if status in {"completed", "failed", "cancelled"}:
+        if status in {"completed", "failed", "cancelled", "timed_out"}:
             update_fields["completed_at"] = completed_at or self._utcnow_iso()
         self.update_job_fields(job_id, **update_fields)
 
@@ -359,7 +360,7 @@ class JobRepoSQLite:
             where.append("status = ?")
             params.append(status)
         elif not include_all:
-            where.append("status IN ('completed', 'failed', 'cancelled')")
+            where.append("status IN ('completed', 'failed', 'cancelled', 'timed_out')")
         if before_iso:
             where.append("COALESCE(completed_at, created_at) < ?")
             params.append(before_iso)

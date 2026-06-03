@@ -164,7 +164,7 @@ InputOption = Annotated[
 ]
 StatusFilterOption = Annotated[
     Optional[str],
-    typer.Option("--status", help="按任务状态过滤，例如 `queued`、`running`、`completed`、`failed`、`cancelled`。"),
+    typer.Option("--status", help="按任务状态过滤，例如 `queued`、`running`、`completed`、`failed`、`cancelled`、`timed_out`。"),
 ]
 SourceFilterOption = Annotated[
     Optional[str],
@@ -194,7 +194,7 @@ _DEFAULT_HEARTBEAT_SECONDS = 30
 _DEFAULT_STALE_SECONDS = 90
 _MAX_RECENT_EVENTS = 5
 _PROGRESS_BAR_WIDTH = 24
-_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 _SCHEMA_TIER_LABELS = {
     "required": "必填",
     "recommended": "推荐",
@@ -4840,7 +4840,7 @@ def job_clean(
     status: StatusFilterOption = None,
     all_mode: Annotated[
         bool,
-        typer.Option("--all", help="包含所有非运行态任务，而不只限于 `completed`、`failed`、`cancelled`。"),
+        typer.Option("--all", help="包含所有非运行态任务，而不只限于 `completed`、`failed`、`cancelled`、`timed_out`。"),
     ] = False,
     yes: Annotated[
         bool,

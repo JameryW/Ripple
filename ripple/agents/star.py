@@ -9,7 +9,6 @@
 / Unaware of: global state, other agents, propagation overview, platform params.
 """
 
-import json
 import logging
 from typing import Any, Callable, Awaitable, Dict, List
 
@@ -19,6 +18,7 @@ from ripple.prompts import (
     STAR_MEMORY_LINE,
     STAR_MEMORY_HEADER,
 )
+from ripple.utils.json_parser import parse_json_from_llm
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,9 @@ class StarAgent:
         """收到涟漪后生成响应。 / Generate response upon receiving a ripple."""
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(
-            ripple_content, ripple_energy, ripple_source,
+            ripple_content,
+            ripple_energy,
+            ripple_source,
         )
 
         for attempt in range(1 + self._max_retries):
@@ -72,24 +74,26 @@ class StarAgent:
                     user_prompt=user_prompt,
                 )
                 response = self._parse_response(raw)
-                self.memory.append({
-                    "ripple_content": ripple_content,
-                    "ripple_energy": ripple_energy,
-                    "ripple_source": ripple_source,
-                    "my_response": response,
-                })
+                self.memory.append(
+                    {
+                        "ripple_content": ripple_content,
+                        "ripple_energy": ripple_energy,
+                        "ripple_source": ripple_source,
+                        "my_response": response,
+                    }
+                )
                 return response
             except Exception as e:
-                logger.warning(
-                    f"星 Agent {self.agent_id} 第 {attempt+1} 次失败: {e}"
-                )
+                logger.warning(f"星 Agent {self.agent_id} 第 {attempt + 1} 次失败: {e}")
 
-        self.memory.append({
-            "ripple_content": ripple_content,
-            "ripple_energy": ripple_energy,
-            "ripple_source": ripple_source,
-            "my_response": FALLBACK_RESPONSE,
-        })
+        self.memory.append(
+            {
+                "ripple_content": ripple_content,
+                "ripple_energy": ripple_energy,
+                "ripple_source": ripple_source,
+                "my_response": FALLBACK_RESPONSE,
+            }
+        )
         return dict(FALLBACK_RESPONSE)
 
     def _build_system_prompt(self) -> str:
@@ -100,9 +104,9 @@ class StarAgent:
             for m in recent:
                 memory_lines.append(
                     STAR_MEMORY_LINE.format(
-                        ripple_source=m['ripple_source'],
-                        ripple_content_preview=m['ripple_content'][:50],
-                        response_type=m['my_response']['response_type'],
+                        ripple_source=m["ripple_source"],
+                        ripple_content_preview=m["ripple_content"][:50],
+                        response_type=m["my_response"]["response_type"],
                     )
                 )
             memory_context = STAR_MEMORY_HEADER + "\n".join(memory_lines)
@@ -117,7 +121,10 @@ class StarAgent:
         return base
 
     def _build_user_prompt(
-        self, content: str, energy: float, source: str,
+        self,
+        content: str,
+        energy: float,
+        source: str,
     ) -> str:
         return STAR_USER_PROMPT.format(
             source=source,
@@ -126,22 +133,11 @@ class StarAgent:
         )
 
     def _parse_response(self, raw: str) -> Dict[str, Any]:
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith("```") and not in_block:
-                    in_block = True
-                    continue
-                elif line.strip() == "```" and in_block:
-                    break
-                elif in_block:
-                    json_lines.append(line)
-            text = "\n".join(json_lines)
+        """Parse LLM response using robust JSON parser. / 使用 robust JSON parser 解析 LLM 响应。
 
-        data = json.loads(text)
+        Fix #3: Uses parse_json_from_llm() instead of simple json.loads() + fence stripping.
+        """
+        data = parse_json_from_llm(raw)
         rtype = data.get("response_type", "ignore")
         if rtype not in VALID_RESPONSE_TYPES:
             rtype = "ignore"
