@@ -32,7 +32,9 @@ def _try_parse_mapping(text: str) -> Dict[str, Any] | None:
 def _extract_fenced_blocks(text: str) -> list[str]:
     """提取 fenced code block 内容。 / Extract fenced code block payloads."""
     blocks: list[str] = []
-    for match in re.finditer(r"```(?:json|yaml)?\s*\n(.*?)\n\s*```", text, re.DOTALL | re.IGNORECASE):
+    for match in re.finditer(
+        r"```(?:json|yaml)?\s*\n(.*?)\n\s*```", text, re.DOTALL | re.IGNORECASE
+    ):
         candidate = match.group(1).strip()
         if candidate:
             blocks.append(candidate)

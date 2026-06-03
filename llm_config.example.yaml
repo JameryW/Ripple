@@ -87,6 +87,10 @@ _default:
                                           # （claude-opus-4-6/4-7 等模型必须删除；gpt-5.4/5.5 等需与 top_k/top_p 二选一）
                                           # (remove for claude-opus-4-6/4-7 etc.; pick only one of temperature / top_k for gpt-5.4/5.5 etc.)
   max_retries: 3
+  # json_mode: false                    # Fix #3: JSON structured output mode (default false)
+                                          # When true, adds response_format={"type":"json_object"} for OpenAI
+                                          # or assistant prefill "\n{" for Anthropic
+                                          # Recommended: set json_mode: true for omniscient/star/sea/tribunal
   # stream: true                         # 流式调用（SSE），默认 true；设为 false 切换为非流式
                                           # Streaming (SSE), default true; set false for non-streaming
   # timeout: 120                          # 单次 LLM 请求超时（秒），可被 simulate(llm_timeout=) 覆盖

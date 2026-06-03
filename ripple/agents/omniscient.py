@@ -10,29 +10,25 @@ The only agent with full context, responsible for:
 v4: Prompt stratification — instructions/schema → system_prompt, data → user_prompt.
 """
 
+import asyncio
 import json
 import logging
-from typing import Any, Callable, Awaitable, Dict, List, Optional, Tuple
+import os
+import time
+from typing import Any, Callable, Awaitable, Dict, Optional, Tuple
 
 from ripple.primitives.models import (
-    OmniscientVerdict, AgentActivation, AgentSkip,
-    PhaseVector, Ripple,
+    OmniscientVerdict,
+    AgentActivation,
+    AgentSkip,
 )
 from ripple.prompts import (
     RETRY_JSON_PREFIX,
     RETRY_JSON_PREFIX_SHORT,
-    OMNISCIENT_INIT_DYNAMICS,
     OMNISCIENT_INIT_DYNAMICS_HORIZON_LINE,
-    OMNISCIENT_INIT_AGENTS,
-    OMNISCIENT_INIT_TOPOLOGY,
     OMNISCIENT_RIPPLE_TIME_PROGRESS,
     OMNISCIENT_RIPPLE_CAS_PRINCIPLES,
     OMNISCIENT_RIPPLE_WAVE0_HINT,
-    OMNISCIENT_RIPPLE_VERDICT,
-    OMNISCIENT_OBSERVE,
-    OMNISCIENT_SYNTHESIZE_RELATIVE,
-    OMNISCIENT_SYNTHESIZE_ANCHORED,
-    # v4 split templates
     OMNISCIENT_INIT_DYNAMICS_SYSTEM,
     OMNISCIENT_INIT_DYNAMICS_USER,
     OMNISCIENT_INIT_AGENTS_SYSTEM,
@@ -48,8 +44,25 @@ from ripple.prompts import (
     OMNISCIENT_SYNTHESIZE_ANCHORED_SYSTEM,
     OMNISCIENT_SYNTHESIZE_ANCHORED_USER,
 )
+from ripple.utils.json_parser import parse_json_from_llm
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SYNTHESIZE prompt truncation limits (env-var configurable)
+# ---------------------------------------------------------------------------
+SYNTHESIZE_MAX_SNAPSHOT_CHARS = int(
+    os.environ.get("RIPPLE_SYNTHESIZE_MAX_SNAPSHOT_CHARS", "20000")
+)
+SYNTHESIZE_MAX_OBS_CHARS = int(
+    os.environ.get("RIPPLE_SYNTHESIZE_MAX_OBS_CHARS", "15000")
+)
+SYNTHESIZE_MAX_INPUT_CHARS = int(
+    os.environ.get("RIPPLE_SYNTHESIZE_MAX_INPUT_CHARS", "5000")
+)
+SYNTHESIZE_MAX_TOKENS_OVERRIDE = int(
+    os.environ.get("RIPPLE_SYNTHESIZE_MAX_TOKENS", "8192")
+)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -70,8 +83,11 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 # 全视者 INIT 输出必须包含的字段 / Required fields in Omniscient INIT output
 INIT_REQUIRED_FIELDS = {
-    "star_configs", "sea_configs", "topology",
-    "dynamic_parameters", "seed_ripple",
+    "star_configs",
+    "sea_configs",
+    "topology",
+    "dynamic_parameters",
+    "seed_ripple",
 }
 
 # OBSERVE / SYNTHESIZE: 输出字段由 Skill prompt 定义，引擎不再硬编码检查。
@@ -91,12 +107,17 @@ class OmniscientAgent:
         self._system_prompt = system_prompt
         self._max_retries = max_retries
         self._init_result: Optional[Dict[str, Any]] = None
+        # Per-phase timeout tracking (Fix #1b)
+        self._phase_time_budget: float = 0.0  # Set when phase starts
+        self._phase_time_used: float = 0.0
+        self._current_phase: Optional[str] = None
 
     async def _call_llm(
         self,
         user_prompt: str,
         phase: str = "",
         phase_system_prompt: str = "",
+        call_timeout: Optional[float] = None,
     ) -> str:
         """调用 LLM，由引擎注入的 caller 处理实际路由。 / Call LLM; routing handled by injected caller.
 
@@ -104,36 +125,102 @@ class OmniscientAgent:
         送入 system_prompt 可信区。运行时数据仅出现在 user_prompt 非可信区。
         / phase_system_prompt contains phase instructions/schema, merged with self._system_prompt
         into the trusted system_prompt zone. Runtime data only in user_prompt untrusted zone.
+
+        Fix #1b: Per-call timeout tracking with cumulative phase budget awareness.
         """
         if phase:
             logger.info(f"Omniscient 调用 LLM: {phase}")
+            self._current_phase = phase
 
         # Merge base system_prompt (may include skill context) with phase instructions
         parts = [p for p in (self._system_prompt, phase_system_prompt) if p]
         combined_system = "\n\n".join(parts)
 
-        return await self._llm_caller(
-            system_prompt=combined_system,
-            user_prompt=user_prompt,
-        )
+        # Per-LLM-call timeout tracking (Fix #1b)
+        call_start = time.monotonic()
+
+        # Determine per-call timeout: explicit call_timeout > remaining phase budget > no timeout
+        effective_timeout = call_timeout
+        if effective_timeout is None and self._phase_time_budget > 0:
+            remaining = self._phase_time_budget - self._phase_time_used
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Phase '{self._current_phase}' LLM budget exhausted "
+                    f"(used {self._phase_time_used:.1f}s / budget {self._phase_time_budget:.1f}s)"
+                )
+            effective_timeout = remaining
+
+        try:
+            if effective_timeout is not None and effective_timeout > 0:
+                result = await asyncio.wait_for(
+                    self._llm_caller(
+                        system_prompt=combined_system,
+                        user_prompt=user_prompt,
+                    ),
+                    timeout=effective_timeout,
+                )
+            else:
+                result = await self._llm_caller(
+                    system_prompt=combined_system,
+                    user_prompt=user_prompt,
+                )
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - call_start
+            self._phase_time_used += elapsed
+            logger.warning(
+                f"Omniscient LLM call timed out after {elapsed:.1f}s "
+                f"(phase={self._current_phase}, budget={self._phase_time_budget:.1f}s, "
+                f"cumulative={self._phase_time_used:.1f}s)"
+            )
+            raise TimeoutError(
+                f"LLM call timed out after {elapsed:.1f}s in phase '{self._current_phase}'"
+            )
+
+        elapsed = time.monotonic() - call_start
+        self._phase_time_used += elapsed
+
+        # Warn if approaching phase budget
+        if self._phase_time_budget > 0:
+            remaining = self._phase_time_budget - self._phase_time_used
+            if remaining < self._phase_time_budget * 0.2:
+                logger.warning(
+                    f"Omniscient phase '{self._current_phase}' approaching timeout: "
+                    f"{self._phase_time_used:.1f}s / {self._phase_time_budget:.1f}s "
+                    f"({remaining:.1f}s remaining)"
+                )
+
+        return result
+
+    def set_phase_timeout(self, phase: str, budget: float) -> None:
+        """Set the per-phase timeout budget for LLM call tracking."""
+        self._current_phase = phase
+        self._phase_time_budget = budget
+        self._phase_time_used = 0.0
 
     def _parse_json(self, raw: str) -> Dict[str, Any]:
-        """从 LLM 输出中提取 JSON。支持 markdown code block 包裹。 / Extract JSON from LLM output; supports markdown code blocks."""
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith("```") and not in_block:
-                    in_block = True
-                    continue
-                elif line.strip() == "```" and in_block:
-                    break
-                elif in_block:
-                    json_lines.append(line)
-            text = "\n".join(json_lines)
-        return json.loads(text)
+        """从 LLM 输出中提取 JSON。使用 robust parser。 / Extract JSON from LLM output using robust parser.
+
+        Fix #3: Uses parse_json_from_llm() instead of simple json.loads() to handle
+        markdown fences, balanced-brace extraction, YAML fallback, etc.
+        """
+        try:
+            return parse_json_from_llm(raw)
+        except Exception as e:
+            raise json.JSONDecodeError(str(e), raw, 0)
+
+    @staticmethod
+    def _truncate_json(data: Any, max_chars: int) -> str:
+        """Serialize data to JSON with size truncation. / 序列化 JSON 并限制大小。
+
+        Fix #2: Truncates large JSON blobs before injecting into prompts to prevent
+        context window overflow and excessive generation time.
+        """
+        s = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        if len(s) <= max_chars:
+            return s
+        return s[:max_chars] + (
+            f"\n... [TRUNCATED: {len(s)} chars total, showing first {max_chars}]"
+        )
 
     # =========================================================================
     # Phase INIT
@@ -146,18 +233,16 @@ class OmniscientAgent:
     ) -> Dict[str, Any]:
         """Phase INIT: 初始化模拟场景（3 次聚焦 LLM 调用）。 / Initialize simulation scene (3 focused LLM calls).
 
-        Sub-call 1: 场景分析 + 时间参数 / Scene analysis + time params (dynamic_parameters)
-        Sub-call 2: Agent 配置 / Agent configs (star_configs, sea_configs)
-        Sub-call 3: 拓扑 + 种子 / Topology + seed (topology, seed_ripple)
-
-        Args:
-            skill_profile: Skill 自然语言画像 / Skill natural language profile
-            simulation_input: 模拟请求 / Simulation request (event, source, historical, etc.)
-
-        Returns:
-            初始化结果 / Init result with star_configs, sea_configs, topology,
-            dynamic_parameters, seed_ripple
+        Fix #1b: Sets phase timeout budget for cumulative LLM call tracking.
         """
+        from ripple.engine.runtime import (
+            _resolve_phase_timeout,
+            _PHASE_TIMEOUTS_ENABLED,
+        )
+
+        if _PHASE_TIMEOUTS_ENABLED:
+            self.set_phase_timeout("INIT", _resolve_phase_timeout("INIT"))
+
         # Sub-call 1: 场景分析 + 时间参数 / Scene analysis + time params
         dynamic_parameters = await self._init_sub_call(
             self._build_init_dynamics_prompt(skill_profile, simulation_input),
@@ -169,7 +254,9 @@ class OmniscientAgent:
         # Sub-call 2: Agent 配置 / Agent configs
         agents_result = await self._init_sub_call(
             self._build_init_agents_prompt(
-                skill_profile, simulation_input, dynamic_parameters,
+                skill_profile,
+                simulation_input,
+                dynamic_parameters,
             ),
             phase="INIT:agents",
             required_fields={"star_configs", "sea_configs"},
@@ -179,7 +266,9 @@ class OmniscientAgent:
         # Sub-call 3: 拓扑 + 种子 / Topology + seed
         topology_result = await self._init_sub_call(
             self._build_init_topology_prompt(
-                skill_profile, simulation_input, dynamic_parameters,
+                skill_profile,
+                simulation_input,
+                dynamic_parameters,
                 agents_result,
             ),
             phase="INIT:topology",
@@ -228,14 +317,9 @@ class OmniscientAgent:
                 return result
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 last_error = e
-                logger.warning(
-                    f"全视者 {error_label} 第 {attempt + 1} 次尝试失败: {e}"
-                )
+                logger.warning(f"全视者 {error_label} 第 {attempt + 1} 次尝试失败: {e}")
                 if attempt < self._max_retries:
-                    current_user = (
-                        RETRY_JSON_PREFIX.format(error=e)
-                        + user_prompt
-                    )
+                    current_user = RETRY_JSON_PREFIX.format(error=e) + user_prompt
 
         raise RuntimeError(
             f"全视者 {error_label} 在 {1 + self._max_retries} 次尝试后仍然失败: "
@@ -255,7 +339,8 @@ class OmniscientAgent:
         horizon = simulation_input.get("simulation_horizon", "")
         horizon_line = (
             OMNISCIENT_INIT_DYNAMICS_HORIZON_LINE.format(horizon=horizon)
-            if horizon else ""
+            if horizon
+            else ""
         )
         system = OMNISCIENT_INIT_DYNAMICS_SYSTEM.format(horizon_line=horizon_line)
         user = OMNISCIENT_INIT_DYNAMICS_USER.format(
@@ -302,7 +387,8 @@ class OmniscientAgent:
                 "star_configs": agents_result["star_configs"],
                 "sea_configs": agents_result["sea_configs"],
             },
-            ensure_ascii=False, indent=2,
+            ensure_ascii=False,
+            indent=2,
         )
         system = OMNISCIENT_INIT_TOPOLOGY_SYSTEM
         user = OMNISCIENT_INIT_TOPOLOGY_USER.format(
@@ -337,18 +423,19 @@ class OmniscientAgent:
     ) -> OmniscientVerdict:
         """Phase RIPPLE: 每轮波纹的传播裁决。 / Propagation verdict for each wave.
 
-        Args:
-            field_snapshot: 当前 Field 快照 / Current Field snapshot (agents, ripples, topology)
-            wave_number: 当前 wave 序号 / Current wave number
-            propagation_history: 传播历史摘要 / Propagation history summary
-            wave_time_window: 每轮 wave 对应的现实时间 / Real time per wave (e.g. "4h")
-            simulation_horizon: 模拟总时长 / Total simulation horizon (e.g. "48h")
-
-        Returns:
-            OmniscientVerdict 含激活列表和 continue 决定 / OmniscientVerdict with activation list and continue decision
+        Fix #1b: Sets phase timeout budget on first wave for cumulative LLM call tracking.
         """
+        from ripple.engine.runtime import (
+            _resolve_phase_timeout,
+            _PHASE_TIMEOUTS_ENABLED,
+        )
+
+        if _PHASE_TIMEOUTS_ENABLED and wave_number == 0:
+            self.set_phase_timeout("RIPPLE", _resolve_phase_timeout("RIPPLE"))
         phase_system, user_prompt = self._build_ripple_prompt(
-            field_snapshot, wave_number, propagation_history,
+            field_snapshot,
+            wave_number,
+            propagation_history,
             wave_time_window=wave_time_window,
             simulation_horizon=simulation_horizon,
         )
@@ -365,14 +452,9 @@ class OmniscientAgent:
                 return self._parse_verdict(data)
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 last_error = e
-                logger.warning(
-                    f"全视者 RIPPLE 裁决第 {attempt + 1} 次尝试失败: {e}"
-                )
+                logger.warning(f"全视者 RIPPLE 裁决第 {attempt + 1} 次尝试失败: {e}")
                 if attempt < self._max_retries:
-                    user_prompt = (
-                        RETRY_JSON_PREFIX_SHORT.format(error=e)
-                        + user_prompt
-                    )
+                    user_prompt = RETRY_JSON_PREFIX_SHORT.format(error=e) + user_prompt
 
         # 安全降级：终止传播 / Safe fallback: stop propagation
         logger.error(f"全视者 RIPPLE 裁决失败，安全降级为终止传播: {last_error}")
@@ -400,40 +482,43 @@ class OmniscientAgent:
         Returns: (phase_system_prompt, user_prompt)
         """
         snapshot_json = json.dumps(
-            field_snapshot, ensure_ascii=False, indent=2, default=str,
+            field_snapshot,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
         )
 
         # 显式列出可用 Agent 及其激活统计 / Explicitly list available agents with activation stats
         agent_lines = []
         for sid, info in field_snapshot.get("stars", {}).items():
-            desc = info.get('description', '')
-            act_count = info.get('activation_count', 0)
-            last_e = info.get('last_energy', 0.0)
-            last_resp = info.get('last_response')
+            desc = info.get("description", "")
+            act_count = info.get("activation_count", 0)
+            last_e = info.get("last_energy", 0.0)
+            last_resp = info.get("last_response")
             if act_count > 0:
                 agent_lines.append(
-                    f"  - agent_id: \"{sid}\" (Star/KOL): {desc} "
+                    f'  - agent_id: "{sid}" (Star/KOL): {desc} '
                     f"| 已激活{act_count}次, 上次能量={last_e:.2f}, "
                     f"上次响应={last_resp}"
                 )
             else:
                 agent_lines.append(
-                    f"  - agent_id: \"{sid}\" (Star/KOL): {desc} | 尚未激活"
+                    f'  - agent_id: "{sid}" (Star/KOL): {desc} | 尚未激活'
                 )
         for sid, info in field_snapshot.get("seas", {}).items():
-            desc = info.get('description', '')
-            act_count = info.get('activation_count', 0)
-            last_e = info.get('last_energy', 0.0)
-            last_resp = info.get('last_response')
+            desc = info.get("description", "")
+            act_count = info.get("activation_count", 0)
+            last_e = info.get("last_energy", 0.0)
+            last_resp = info.get("last_response")
             if act_count > 0:
                 agent_lines.append(
-                    f"  - agent_id: \"{sid}\" (Sea/群体): {desc} "
+                    f'  - agent_id: "{sid}" (Sea/群体): {desc} '
                     f"| 已激活{act_count}次, 上次能量={last_e:.2f}, "
                     f"上次响应={last_resp}"
                 )
             else:
                 agent_lines.append(
-                    f"  - agent_id: \"{sid}\" (Sea/群体): {desc} | 尚未激活"
+                    f'  - agent_id: "{sid}" (Sea/群体): {desc} | 尚未激活'
                 )
         agent_list = "\n".join(agent_lines) if agent_lines else "  （无可用 Agent）"
 
@@ -441,6 +526,7 @@ class OmniscientAgent:
         time_progress = ""
         if wave_time_window and simulation_horizon:
             from ripple.engine.runtime import _parse_hours
+
             wtw_h = _parse_hours(wave_time_window)
             horizon_h = _parse_hours(simulation_horizon)
             if wtw_h > 0 and horizon_h > 0:
@@ -476,7 +562,9 @@ class OmniscientAgent:
         activated = [
             AgentActivation(
                 agent_id=a["agent_id"],
-                incoming_ripple_energy=_safe_float(a.get("incoming_ripple_energy", 0.5)),
+                incoming_ripple_energy=_safe_float(
+                    a.get("incoming_ripple_energy", 0.5)
+                ),
                 activation_reason=a["activation_reason"],
             )
             for a in data.get("activated_agents", [])
@@ -518,7 +606,9 @@ class OmniscientAgent:
             观测结果 / Observation with phase_vector, phase_transition_detected,
             emergence_events, topology_recommendations
         """
-        phase_system, user_prompt = self._build_observe_prompt(field_snapshot, full_history)
+        phase_system, user_prompt = self._build_observe_prompt(
+            field_snapshot, full_history
+        )
 
         last_error = None
         for attempt in range(1 + self._max_retries):
@@ -533,20 +623,16 @@ class OmniscientAgent:
                 return result
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 last_error = e
-                logger.warning(
-                    f"全视者 OBSERVE 第 {attempt + 1} 次尝试失败: {e}"
-                )
+                logger.warning(f"全视者 OBSERVE 第 {attempt + 1} 次尝试失败: {e}")
                 if attempt < self._max_retries:
-                    user_prompt = (
-                        RETRY_JSON_PREFIX_SHORT.format(error=e)
-                        + user_prompt
-                    )
+                    user_prompt = RETRY_JSON_PREFIX_SHORT.format(error=e) + user_prompt
 
         # 安全降级：返回默认观测 / Safe fallback: return default observation
         logger.error(f"全视者 OBSERVE 失败，返回默认观测: {last_error}")
         return {
             "phase_vector": {
-                "heat": "unknown", "sentiment": "unknown",
+                "heat": "unknown",
+                "sentiment": "unknown",
                 "coherence": "unknown",
             },
             "phase_transition_detected": False,
@@ -564,7 +650,10 @@ class OmniscientAgent:
         Returns: (phase_system_prompt, user_prompt)
         """
         snapshot_json = json.dumps(
-            field_snapshot, ensure_ascii=False, indent=2, default=str,
+            field_snapshot,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
         )
         system = OMNISCIENT_OBSERVE_SYSTEM
         user = OMNISCIENT_OBSERVE_USER.format(
@@ -590,17 +679,22 @@ class OmniscientAgent:
     ) -> Dict[str, Any]:
         """合成最终预测结果。 / Synthesize final prediction result.
 
-        Args:
-            field_snapshot: 最终 Field 快照 / Final Field snapshot
-            observation: OBSERVE 阶段的输出 / OBSERVE phase output
-            simulation_input: 原始模拟请求 / Original simulation request
-
-        Returns:
-            预测结果 / Prediction with prediction, timeline, bifurcation_points,
-            agent_insights
+        Fix #2: Overrides max_tokens to SYNTHESIZE_MAX_TOKENS_OVERRIDE (8192).
+        Fix #1b: Sets phase timeout budget for cumulative LLM call tracking.
         """
+        # Set phase timeout budget for SYNTHESIZE
+        from ripple.engine.runtime import (
+            _resolve_phase_timeout,
+            _PHASE_TIMEOUTS_ENABLED,
+        )
+
+        if _PHASE_TIMEOUTS_ENABLED:
+            self.set_phase_timeout("SYNTHESIZE", _resolve_phase_timeout("SYNTHESIZE"))
+
         phase_system, user_prompt = self._build_synth_prompt(
-            field_snapshot, observation, simulation_input,
+            field_snapshot,
+            observation,
+            simulation_input,
         )
 
         last_error = None
@@ -610,20 +704,16 @@ class OmniscientAgent:
                     user_prompt,
                     phase="SYNTHESIZE",
                     phase_system_prompt=phase_system,
+                    call_timeout=180.0,  # Fix #2: Override SYNTHESIZE per-call timeout
                 )
                 result = self._parse_json(raw)
                 self._validate_synth_result(result)
                 return result
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 last_error = e
-                logger.warning(
-                    f"全视者结果合成第 {attempt + 1} 次尝试失败: {e}"
-                )
+                logger.warning(f"全视者结果合成第 {attempt + 1} 次尝试失败: {e}")
                 if attempt < self._max_retries:
-                    user_prompt = (
-                        RETRY_JSON_PREFIX_SHORT.format(error=e)
-                        + user_prompt
-                    )
+                    user_prompt = RETRY_JSON_PREFIX_SHORT.format(error=e) + user_prompt
 
         logger.error(f"全视者结果合成失败: {last_error}")
         return {
@@ -641,25 +731,26 @@ class OmniscientAgent:
     ) -> Tuple[str, str]:
         """Build SYNTHESIZE prompts.
 
+        Fix #2: Uses _truncate_json to cap large JSON blobs before injection.
         Returns: (phase_system_prompt, user_prompt)
         """
-        snapshot_json = json.dumps(
-            field_snapshot, ensure_ascii=False, indent=2, default=str,
+        snapshot_json = self._truncate_json(
+            field_snapshot, SYNTHESIZE_MAX_SNAPSHOT_CHARS
         )
-        obs_json = json.dumps(
-            observation, ensure_ascii=False, indent=2, default=str,
-        )
-        input_json = json.dumps(
-            simulation_input, ensure_ascii=False, indent=2, default=str,
+        obs_json = self._truncate_json(observation, SYNTHESIZE_MAX_OBS_CHARS)
+        input_json = self._truncate_json(
+            simulation_input, SYNTHESIZE_MAX_INPUT_CHARS
         )
 
         has_historical = bool(simulation_input.get("historical"))
         system = (
-            OMNISCIENT_SYNTHESIZE_ANCHORED_SYSTEM if has_historical
+            OMNISCIENT_SYNTHESIZE_ANCHORED_SYSTEM
+            if has_historical
             else OMNISCIENT_SYNTHESIZE_RELATIVE_SYSTEM
         )
         user_template = (
-            OMNISCIENT_SYNTHESIZE_ANCHORED_USER if has_historical
+            OMNISCIENT_SYNTHESIZE_ANCHORED_USER
+            if has_historical
             else OMNISCIENT_SYNTHESIZE_RELATIVE_USER
         )
         user = user_template.format(

@@ -8,7 +8,7 @@ for structured evaluation and debate of product proposals.
 
 import json
 import logging
-from typing import Any, Callable, Awaitable, Dict, List
+from typing import Any, Callable, Awaitable, Dict, List, Optional
 
 from ripple.primitives.pmf_models import TribunalOpinion
 from ripple.utils.json_parser import parse_json_from_llm
@@ -34,12 +34,16 @@ def _safe_int_score(value: Any, default: int = 3) -> int:
         try:
             return int(float(value.strip()))
         except (ValueError, TypeError):
-            logger.warning(f"Cannot coerce score string: {value!r}, using default {default}")
+            logger.warning(
+                f"Cannot coerce score string: {value!r}, using default {default}"
+            )
             return default
     if isinstance(value, dict):
         nested = value.get("score", value.get("value", default))
         return _safe_int_score(nested, default)
-    logger.warning(f"Unexpected score type {type(value).__name__}: {value!r}, using default {default}")
+    logger.warning(
+        f"Unexpected score type {type(value).__name__}: {value!r}, using default {default}"
+    )
     return default
 
 
@@ -62,7 +66,25 @@ class TribunalAgent:
         self._system_prompt = system_prompt
         self._max_retries = max_retries
 
-    async def _call_llm(self, user_prompt: str) -> str:
+    async def _call_llm(
+        self, user_prompt: str, call_timeout: Optional[float] = None
+    ) -> str:
+        """Call LLM with optional per-call timeout. / 调用 LLM，支持单次调用超时。"""
+        if call_timeout is not None and call_timeout > 0:
+            import asyncio
+
+            try:
+                return await asyncio.wait_for(
+                    self._llm_caller(
+                        system_prompt=self._system_prompt,
+                        user_prompt=user_prompt,
+                    ),
+                    timeout=call_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"TribunalAgent {self.role} LLM call timed out after {call_timeout}s"
+                )
         return await self._llm_caller(
             system_prompt=self._system_prompt,
             user_prompt=user_prompt,
@@ -82,14 +104,16 @@ class TribunalAgent:
             f"## Evidence from simulation\n{evidence}\n\n"
             f"## Scoring rubric\n{rubric}\n\n"
             f"## Dimensions to evaluate\n{', '.join(dimensions)}\n\n"
-            "Respond with JSON: {\"scores\": {dimension: 1-5}, \"narrative\": \"your analysis\"}"
+            'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "your analysis"}'
         )
         last_error = None
         for attempt in range(1 + self._max_retries):
             try:
                 raw = await self._call_llm(prompt)
                 data = parse_json_from_llm(raw)
-                scores = {k: _safe_int_score(v) for k, v in data.get("scores", {}).items()}
+                scores = {
+                    k: _safe_int_score(v) for k, v in data.get("scores", {}).items()
+                }
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
@@ -98,9 +122,13 @@ class TribunalAgent:
                 )
             except (json.JSONDecodeError, KeyError) as e:
                 last_error = e
-                logger.warning(f"TribunalAgent {self.role} evaluate attempt {attempt + 1} failed: {e}")
+                logger.warning(
+                    f"TribunalAgent {self.role} evaluate attempt {attempt + 1} failed: {e}"
+                )
 
-        logger.error(f"TribunalAgent {self.role} evaluate failed after retries: {last_error}")
+        logger.error(
+            f"TribunalAgent {self.role} evaluate failed after retries: {last_error}"
+        )
         return TribunalOpinion(
             member_role=self.role,
             scores={d: 3 for d in dimensions},
@@ -118,7 +146,7 @@ class TribunalAgent:
             f"Another evaluator ({other_opinion.member_role}) gave this assessment:\n"
             f"Scores: {json.dumps(other_opinion.scores)}\n"
             f"Narrative: {other_opinion.narrative}\n\n"
-            "Respond with JSON: {\"challenge\": \"your specific challenge to their assessment\"}"
+            'Respond with JSON: {"challenge": "your specific challenge to their assessment"}'
         )
         try:
             raw = await self._call_llm(prompt)
@@ -142,14 +170,16 @@ class TribunalAgent:
             f"Narrative: {original_opinion.narrative}\n\n"
             f"Challenges received:\n{challenges_text}\n\n"
             "Revise your assessment. You may keep, raise, or lower scores.\n"
-            "Respond with JSON: {\"scores\": {dimension: 1-5}, \"narrative\": \"revised analysis\"}"
+            'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "revised analysis"}'
         )
         last_error = None
         for attempt in range(1 + self._max_retries):
             try:
                 raw = await self._call_llm(prompt)
                 data = parse_json_from_llm(raw)
-                scores = {k: _safe_int_score(v) for k, v in data.get("scores", {}).items()}
+                scores = {
+                    k: _safe_int_score(v) for k, v in data.get("scores", {}).items()
+                }
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
@@ -158,7 +188,9 @@ class TribunalAgent:
                 )
             except (json.JSONDecodeError, KeyError) as e:
                 last_error = e
-                logger.warning(f"TribunalAgent {self.role} revise attempt {attempt + 1} failed: {e}")
+                logger.warning(
+                    f"TribunalAgent {self.role} revise attempt {attempt + 1} failed: {e}"
+                )
 
         return TribunalOpinion(
             member_role=self.role,

@@ -52,12 +52,16 @@ class ModelEndpointConfig:
     """
 
     # --- 必填：模型标识 / Required: model identity ---
-    model_platform: str  # 平台标识 / Platform: "openai" / "anthropic" / "bedrock" / "deepseek" etc.
+    model_platform: (
+        str  # 平台标识 / Platform: "openai" / "anthropic" / "bedrock" / "deepseek" etc.
+    )
     model_name: str  # 模型名称 / Model name: "gpt-4o" / "claude-opus-4-6" etc.
 
     # --- 可选：连接信息 / Optional: connection info ---
     api_key: Optional[str] = None  # API 密钥 / API key
-    url: Optional[str] = None  # 自定义 endpoint URL / Custom endpoint URL (proxy, private deploy)
+    url: Optional[str] = (
+        None  # 自定义 endpoint URL / Custom endpoint URL (proxy, private deploy)
+    )
 
     # --- 可选：API 模式 / Optional: API mode ---
     # "chat_completions" — 标准 OpenAI Chat Completions 格式（默认） / standard OpenAI format (default)
@@ -78,6 +82,10 @@ class ModelEndpointConfig:
     # --- 可选：Azure 专用 / Optional: Azure-specific ---
     api_version: Optional[str] = None
     azure_deployment_name: Optional[str] = None
+
+    # --- 可选：JSON 结构化输出 / Optional: JSON structured output ---
+    # Fix #3: When True, adapters add response_format/prefill to enforce JSON output
+    json_mode: bool = False
 
     # --- 可选：额外参数（透传给适配器） / Optional: extra params (passed through to adapters) ---
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -101,17 +109,16 @@ class ModelEndpointConfig:
         # 完整格式：从字典提取字段 / Full format: extract fields from dict
         # 优先级 / Priority: model_name > model_type (compat) > model (legacy)
         model_name = (
-            data.get("model_name")
-            or data.get("model_type")
-            or data.get("model", "")
+            data.get("model_name") or data.get("model_type") or data.get("model", "")
         )
-        model_platform = data.get("model_platform") or _infer_platform(
-            model_name
-        )
+        model_platform = data.get("model_platform") or _infer_platform(model_name)
 
         # api_mode：显式指定或自动推断 / Explicit or auto-inferred
         _valid_api_modes = (
-            "chat_completions", "responses", "anthropic", "bedrock",
+            "chat_completions",
+            "responses",
+            "anthropic",
+            "bedrock",
         )
         api_mode = data.get("api_mode") or _infer_api_mode(
             model_platform, data.get("url")
@@ -138,11 +145,16 @@ class ModelEndpointConfig:
             "stream",
             "api_version",
             "azure_deployment_name",
+            "json_mode",
         }
 
         # stream: 默认 True（流式调用），支持显式 False 关闭 / Default True, explicit False to disable
         stream_val = data.get("stream")
         stream = stream_val if isinstance(stream_val, bool) else True
+
+        # json_mode: 默认 False，支持显式 True 开启 / Default False, explicit True to enable
+        json_mode_val = data.get("json_mode")
+        json_mode = json_mode_val if isinstance(json_mode_val, bool) else False
 
         return cls(
             model_platform=model_platform,
@@ -155,19 +167,14 @@ class ModelEndpointConfig:
                 if "temperature" in data and data["temperature"] is not None
                 else None
             ),
-            max_tokens=(
-                data["max_tokens"] if "max_tokens" in data else 4096
-            ),
+            max_tokens=(data["max_tokens"] if "max_tokens" in data else 4096),
             timeout=data.get("timeout"),
             max_retries=int(data.get("max_retries", 3)),
             stream=stream,
             api_version=data.get("api_version"),
             azure_deployment_name=data.get("azure_deployment_name"),
-            extra={
-                k: v
-                for k, v in data.items()
-                if k not in _known_keys
-            },
+            json_mode=json_mode,
+            extra={k: v for k, v in data.items() if k not in _known_keys},
         )
 
 
@@ -200,9 +207,7 @@ def _infer_platform(model_name: str) -> str:
         for kw in keywords:
             if kw in name_lower:
                 return platform
-    logger.debug(
-        "无法从模型名称 '%s' 推断平台，使用默认 'openai'", model_name
-    )
+    logger.debug("无法从模型名称 '%s' 推断平台，使用默认 'openai'", model_name)
     return "openai"
 
 
@@ -366,9 +371,7 @@ class LLMConfigLoader:
         # 第 4 层：文件全局默认 / Layer 4: file global default
         file_default = self._file_config.get("_default", {})
         if isinstance(file_default, dict):
-            merged.update(
-                {k: v for k, v in file_default.items() if v is not None}
-            )
+            merged.update({k: v for k, v in file_default.items() if v is not None})
 
         # 第 3 层：文件角色级配置 / Layer 3: file role-level config
         file_role = self._file_config.get(role, {})
@@ -376,16 +379,12 @@ class LLMConfigLoader:
             merged["model_name"] = file_role
             merged["model_platform"] = _infer_platform(file_role)
         elif isinstance(file_role, dict):
-            merged.update(
-                {k: v for k, v in file_role.items() if v is not None}
-            )
+            merged.update({k: v for k, v in file_role.items() if v is not None})
 
         # 第 2 层：代码全局默认 / Layer 2: code global default
         code_default = self._code_config.get("_default", {})
         if isinstance(code_default, dict):
-            merged.update(
-                {k: v for k, v in code_default.items() if v is not None}
-            )
+            merged.update({k: v for k, v in code_default.items() if v is not None})
 
         # 第 1 层：代码角色级配置（最高优先级） / Layer 1: code role-level (highest)
         code_role = self._code_config.get(role, {})
@@ -393,9 +392,7 @@ class LLMConfigLoader:
             merged["model_name"] = code_role
             merged["model_platform"] = _infer_platform(code_role)
         elif isinstance(code_role, dict):
-            merged.update(
-                {k: v for k, v in code_role.items() if v is not None}
-            )
+            merged.update({k: v for k, v in code_role.items() if v is not None})
 
         # 校验：model_name 必须存在且非空 / Validate: model_name must be present
         # 兼容旧格式 / Legacy compat: model_name > model_type > model
@@ -462,9 +459,7 @@ class LLMConfigLoader:
         """返回所有已配置的角色名列表（不含 _ 开头的元配置键）。 / List all configured role names (excluding _ meta keys)."""
         roles = set()
         for cfg in (self._code_config, self._file_config):
-            roles.update(
-                k for k in cfg.keys() if not k.startswith("_")
-            )
+            roles.update(k for k in cfg.keys() if not k.startswith("_"))
         return sorted(roles)
 
     def resolve_all(
@@ -497,9 +492,7 @@ class LLMConfigLoader:
                 "url": cfg.url or "(auto)",
                 "api_key": _mask_key(cfg.api_key),
                 "temperature": (
-                    str(cfg.temperature)
-                    if cfg.temperature is not None
-                    else "(unset)"
+                    str(cfg.temperature) if cfg.temperature is not None else "(unset)"
                 ),
             }
         return result

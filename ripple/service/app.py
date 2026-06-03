@@ -155,7 +155,7 @@ def create_app() -> FastAPI:
                 event = await q.get()
                 yield f"event: {event['type']}\n"
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event["type"] in {"job.completed", "job.failed", "job.cancelled"}:
+                if event["type"] in {"job.completed", "job.failed", "job.cancelled", "job.timed_out"}:
                     break
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -21,7 +22,10 @@ from typing import Any, Callable, Awaitable, Dict, List, Optional, TYPE_CHECKING
 
 from ripple.primitives.events import SimulationEvent
 from ripple.primitives.models import (
-    AgentActivation, Field, Ripple, OmniscientVerdict, WaveRecord,
+    AgentActivation,
+    Ripple,
+    OmniscientVerdict,
+    WaveRecord,
 )
 from ripple.agents.omniscient import OmniscientAgent
 from ripple.agents.star import StarAgent
@@ -39,6 +43,50 @@ ProgressCallback = Union[
 ]
 
 SAFETY_WAVE_MULTIPLIER = 3  # 安全上限 = estimated_total_waves * 此系数 / Safety cap = estimated_total_waves * this multiplier
+
+# ---------------------------------------------------------------------------
+# Per-phase timeout defaults (seconds). / Per-phase timeout defaults (seconds).
+# Can be overridden via env var RIPPLE_PHASE_TIMEOUTS_ENABLED=false to disable.
+# Env vars per phase: RIPPLE_PHASE_TIMEOUT_INIT, etc.
+# ---------------------------------------------------------------------------
+_PHASE_TIMEOUTS_DEFAULTS: Dict[str, float] = {
+    "INIT": 60,
+    "SEED": 30,
+    "RIPPLE": 1200,  # 20min — wave loop can be long
+    "DELIBERATE": 600,  # 10min — tribunal rounds
+    "OBSERVE": 120,
+    "SYNTHESIZE": 180,
+}
+
+_PHASE_TIMEOUTS_ENABLED = os.environ.get(
+    "RIPPLE_PHASE_TIMEOUTS_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+
+
+def _resolve_phase_timeout(phase_name: str) -> float:
+    """Resolve per-phase timeout from env var or defaults."""
+    env_key = f"RIPPLE_PHASE_TIMEOUT_{phase_name}"
+    env_val = os.environ.get(env_key)
+    if env_val is not None:
+        try:
+            return float(env_val)
+        except ValueError:
+            logger.warning("Invalid env var %s=%s, using default", env_key, env_val)
+    return _PHASE_TIMEOUTS_DEFAULTS.get(phase_name, 300)
+
+
+# Overall job timeout (seconds). / Overall job timeout (seconds).
+# Env var: RIPPLE_JOB_TIMEOUT (default 1800 = 30min)
+JOB_TIMEOUT = int(os.environ.get("RIPPLE_JOB_TIMEOUT", "1800"))
+
+
+class PhaseTimeoutError(Exception):
+    """Raised when a simulation phase exceeds its configured timeout."""
+
+    def __init__(self, phase: str, timeout: float):
+        self.phase = phase
+        self.timeout = timeout
+        super().__init__(f"Phase '{phase}' exceeded timeout of {timeout}s")
 
 
 def _extract_float(value: Any, default: float = 0.0) -> float:
@@ -142,6 +190,7 @@ class SimulationRuntime:
     ):
         # v4: Build Omniscient system_prompt with skill context injection
         from ripple.prompts import SKILL_CONTEXT_SEPARATOR, SKILL_CONTEXT_END
+
         omniscient_system = ""
         if skill_prompts and skill_prompts.get("omniscient"):
             omniscient_system = (
@@ -197,7 +246,9 @@ class SimulationRuntime:
         return text[: max(0, limit - 1)] + "…"
 
     @classmethod
-    def _short_agent_label_from_description(cls, description: str, fallback: str) -> str:
+    def _short_agent_label_from_description(
+        cls, description: str, fallback: str
+    ) -> str:
         """从画像描述中提取短标签。 / Extract a short human label from an agent description."""
         text = str(description or "").strip()
         if not text:
@@ -289,11 +340,15 @@ class SimulationRuntime:
             if handler is None:
                 continue
 
-            await self._emit(SimulationEvent(
-                type="phase_start", phase=phase_name, run_id=run_id,
-                progress=self._progress(phase_name, 0.0),
-                total_waves=estimated_waves,
-            ))
+            await self._emit(
+                SimulationEvent(
+                    type="phase_start",
+                    phase=phase_name,
+                    run_id=run_id,
+                    progress=self._progress(phase_name, 0.0),
+                    total_waves=estimated_waves,
+                )
+            )
 
             async def emit_progress(
                 event_type: str,
@@ -301,14 +356,16 @@ class SimulationRuntime:
                 phase_fraction: float = 0.0,
                 detail: Optional[Dict[str, Any]] = None,
             ) -> None:
-                await self._emit(SimulationEvent(
-                    type=event_type,
-                    phase=phase_name,
-                    run_id=run_id,
-                    progress=self._progress(phase_name, phase_fraction),
-                    total_waves=estimated_waves,
-                    detail=detail or {},
-                ))
+                await self._emit(
+                    SimulationEvent(
+                        type=event_type,
+                        phase=phase_name,
+                        run_id=run_id,
+                        progress=self._progress(phase_name, phase_fraction),
+                        total_waves=estimated_waves,
+                        detail=detail or {},
+                    )
+                )
 
             context["emit_progress"] = emit_progress
             try:
@@ -318,14 +375,20 @@ class SimulationRuntime:
             except Exception as exc:
                 logger.error(
                     "[%s] Extra phase '%s' failed: %s",
-                    run_id, phase_name, exc,
+                    run_id,
+                    phase_name,
+                    exc,
                 )
-                await self._emit(SimulationEvent(
-                    type="error", phase=phase_name, run_id=run_id,
-                    progress=self._progress(phase_name, 0.0),
-                    total_waves=estimated_waves,
-                    detail={"error": str(exc)},
-                ))
+                await self._emit(
+                    SimulationEvent(
+                        type="error",
+                        phase=phase_name,
+                        run_id=run_id,
+                        progress=self._progress(phase_name, 0.0),
+                        total_waves=estimated_waves,
+                        detail={"error": str(exc)},
+                    )
+                )
                 raise
 
             if not isinstance(result, dict):
@@ -358,12 +421,16 @@ class SimulationRuntime:
                         ],
                     }
 
-            await self._emit(SimulationEvent(
-                type="phase_end", phase=phase_name, run_id=run_id,
-                progress=self._progress(phase_name, 1.0),
-                total_waves=estimated_waves,
-                detail=phase_end_detail,
-            ))
+            await self._emit(
+                SimulationEvent(
+                    type="phase_end",
+                    phase=phase_name,
+                    run_id=run_id,
+                    progress=self._progress(phase_name, 1.0),
+                    total_waves=estimated_waves,
+                    detail=phase_end_detail,
+                )
+            )
             context.pop("emit_progress", None)
 
     async def _emit(self, event: SimulationEvent) -> None:
@@ -434,20 +501,98 @@ class SimulationRuntime:
         """
         run_id = run_id or str(uuid.uuid4())[:8]
         logger.info(f"[{run_id}] 开始模拟")
+
+        # Job-level timeout: wrap entire simulation in asyncio.wait_for
+        if _PHASE_TIMEOUTS_ENABLED and JOB_TIMEOUT > 0:
+            try:
+                return await asyncio.wait_for(
+                    self._run_inner(simulation_input, run_id),
+                    timeout=JOB_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[{run_id}] Job exceeded overall timeout of {JOB_TIMEOUT}s"
+                )
+                return {
+                    "prediction": {"error": f"Job timed out after {JOB_TIMEOUT}s"},
+                    "timeline": [],
+                    "bifurcation_points": [],
+                    "agent_insights": {},
+                    "run_id": run_id,
+                    "timed_out": True,
+                    "timeout_phase": "JOB",
+                }
+        else:
+            return await self._run_inner(simulation_input, run_id)
+
+    async def _run_phase(self, coro, phase_name: str, run_id: str):
+        """Execute a phase coroutine with per-phase timeout if enabled."""
+        if not _PHASE_TIMEOUTS_ENABLED:
+            return await coro
+        timeout = _resolve_phase_timeout(phase_name)
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[{run_id}] Phase {phase_name} exceeded timeout of {timeout}s"
+            )
+            raise PhaseTimeoutError(phase_name, timeout)
+
+    async def _run_inner(
+        self,
+        simulation_input: Dict[str, Any],
+        run_id: str,
+    ) -> Dict[str, Any]:
+        """Inner simulation logic, called by run() with optional job timeout."""
         phase_context: Dict[str, Any] = {
             "run_id": run_id,
             "simulation_input": simulation_input,
             "skill_profile": self._skill_profile,
         }
 
+        try:
+            return await self._run_phases(simulation_input, run_id, phase_context)
+        except PhaseTimeoutError as e:
+            logger.error(f"[{run_id}] Phase {e.phase} timed out after {e.timeout}s")
+            # Return partial results with timeout marker
+            effective_waves = len(self._wave_records)
+            return {
+                "prediction": {
+                    "error": f"Phase '{e.phase}' timed out after {e.timeout}s"
+                },
+                "timeline": [],
+                "bifurcation_points": [],
+                "agent_insights": {},
+                "run_id": run_id,
+                "total_waves": effective_waves,
+                "timed_out": True,
+                "timeout_phase": e.phase,
+            }
+
+    async def _run_phases(
+        self,
+        simulation_input: Dict[str, Any],
+        run_id: str,
+        phase_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute all simulation phases sequentially."""
+
         # Phase 0: INIT
-        await self._emit(SimulationEvent(
-            type="phase_start", phase="INIT", run_id=run_id,
-            progress=self._progress("INIT", 0.0),
-        ))
-        init_result = await self._omniscient.init(
-            skill_profile=self._skill_profile,
-            simulation_input=simulation_input,
+        await self._emit(
+            SimulationEvent(
+                type="phase_start",
+                phase="INIT",
+                run_id=run_id,
+                progress=self._progress("INIT", 0.0),
+            )
+        )
+        init_result = await self._run_phase(
+            self._omniscient.init(
+                skill_profile=self._skill_profile,
+                simulation_input=simulation_input,
+            ),
+            phase_name="INIT",
+            run_id=run_id,
         )
         self._create_agents(init_result)
         # 存储拓扑以供快照使用 / Store topology for snapshot use
@@ -455,12 +600,8 @@ class SimulationRuntime:
 
         dp = init_result.get("dynamic_parameters", {})
         wave_time_window = dp.get("wave_time_window", "")
-        wave_time_window_reasoning = str(
-            dp.get("wave_time_window_reasoning", "") or ""
-        )
-        platform_characteristics = str(
-            dp.get("platform_characteristics", "") or ""
-        )
+        wave_time_window_reasoning = str(dp.get("wave_time_window_reasoning", "") or "")
+        platform_characteristics = str(dp.get("platform_characteristics", "") or "")
         if isinstance(wave_time_window, (int, float)):
             wave_time_window = f"{wave_time_window}h"
         horizon_str = simulation_input.get("simulation_horizon", "")
@@ -477,11 +618,11 @@ class SimulationRuntime:
             )
         else:
             estimated_waves = _extract_int(
-                dp.get("estimated_total_waves", 10), 10,
+                dp.get("estimated_total_waves", 10),
+                10,
             )
             logger.info(
-                f"[{run_id}] 回退到 LLM 估计: "
-                f"estimated_total_waves = {estimated_waves}"
+                f"[{run_id}] 回退到 LLM 估计: estimated_total_waves = {estimated_waves}"
             )
 
         safety_max_waves = estimated_waves * SAFETY_WAVE_MULTIPLIER
@@ -519,24 +660,28 @@ class SimulationRuntime:
                 requested_max_waves=requested_max_waves,
             )
 
-        await self._emit(SimulationEvent(
-            type="phase_end", phase="INIT", run_id=run_id,
-            progress=self._progress("INIT", 1.0),
-            total_waves=estimated_waves,
-            detail={
-                "star_count": len(init_result.get("star_configs", [])),
-                "sea_count": len(init_result.get("sea_configs", [])),
-                "estimated_waves": estimated_waves,
-                "safety_max_waves": safety_max_waves,
-                "requested_max_waves": requested_max_waves,
-                "max_waves": max_waves,
-                "wave_time_window": wave_time_window,
-                "wave_time_window_reasoning": wave_time_window_reasoning,
-                "platform_characteristics": platform_characteristics,
-                "star_labels": self._agent_labels(self._stars),
-                "sea_labels": self._agent_labels(self._seas),
-            },
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_end",
+                phase="INIT",
+                run_id=run_id,
+                progress=self._progress("INIT", 1.0),
+                total_waves=estimated_waves,
+                detail={
+                    "star_count": len(init_result.get("star_configs", [])),
+                    "sea_count": len(init_result.get("sea_configs", [])),
+                    "estimated_waves": estimated_waves,
+                    "safety_max_waves": safety_max_waves,
+                    "requested_max_waves": requested_max_waves,
+                    "max_waves": max_waves,
+                    "wave_time_window": wave_time_window,
+                    "wave_time_window_reasoning": wave_time_window_reasoning,
+                    "platform_characteristics": platform_characteristics,
+                    "star_labels": self._agent_labels(self._stars),
+                    "sea_labels": self._agent_labels(self._seas),
+                },
+            )
+        )
         phase_context["init_result"] = init_result
         phase_context["estimated_waves"] = estimated_waves
         phase_context["max_waves"] = max_waves
@@ -548,13 +693,17 @@ class SimulationRuntime:
             estimated_waves=estimated_waves,
         )
 
-        # Phase 1: SEED
+        # Phase 1: SEED (no LLM calls, purely data construction — skip timeout wrapper)
         logger.info(f"[{run_id}] ━━━ SEED 阶段 ━━━")
-        await self._emit(SimulationEvent(
-            type="phase_start", phase="SEED", run_id=run_id,
-            progress=self._progress("SEED", 0.0),
-            total_waves=estimated_waves,
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_start",
+                phase="SEED",
+                run_id=run_id,
+                progress=self._progress("SEED", 0.0),
+                total_waves=estimated_waves,
+            )
+        )
         seed = init_result.get("seed_ripple", {})
         seed_content = seed.get("content", "")
         if not isinstance(seed_content, str):
@@ -580,15 +729,19 @@ class SimulationRuntime:
         if self._recorder:
             self._recorder.record_seed(seed_content, seed_energy)
 
-        await self._emit(SimulationEvent(
-            type="phase_end", phase="SEED", run_id=run_id,
-            progress=self._progress("SEED", 1.0),
-            total_waves=estimated_waves,
-            detail={
-                "seed_content": seed_content[:200],
-                "seed_energy": seed_energy,
-            },
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_end",
+                phase="SEED",
+                run_id=run_id,
+                progress=self._progress("SEED", 1.0),
+                total_waves=estimated_waves,
+                detail={
+                    "seed_content": seed_content[:200],
+                    "seed_energy": seed_energy,
+                },
+            )
+        )
         phase_context["seed_ripple"] = {
             "content": seed_content,
             "initial_energy": seed_energy,
@@ -604,20 +757,41 @@ class SimulationRuntime:
         # Phase 2: RIPPLE (统一涟漪循环) / Unified ripple loop
         wave_count = 0
         content_preview = seed_ripple.content[:50] if seed_ripple.content else ""
-        history_lines = [f"种子涟漪已注入: '{content_preview}', "
-                         f"能量={seed_ripple.energy}"]
+        history_lines = [
+            f"种子涟漪已注入: '{content_preview}', 能量={seed_ripple.energy}"
+        ]
 
-        await self._emit(SimulationEvent(
-            type="phase_start", phase="RIPPLE", run_id=run_id,
-            progress=self._progress("RIPPLE", 0.0),
-            wave=0, total_waves=estimated_waves,
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_start",
+                phase="RIPPLE",
+                run_id=run_id,
+                progress=self._progress("RIPPLE", 0.0),
+                wave=0,
+                total_waves=estimated_waves,
+            )
+        )
+
+        # Track RIPPLE phase start time for per-phase timeout check
+        _ripple_phase_start = time.monotonic()
+        _ripple_timeout = (
+            _resolve_phase_timeout("RIPPLE") if _PHASE_TIMEOUTS_ENABLED else 0
+        )
+        _ripple_timed_out = False
 
         while wave_count < max_waves:
+            # Per-phase timeout check for RIPPLE
+            if _PHASE_TIMEOUTS_ENABLED and _ripple_timeout > 0:
+                _elapsed = time.monotonic() - _ripple_phase_start
+                if _elapsed > _ripple_timeout:
+                    logger.error(
+                        f"[{run_id}] RIPPLE phase exceeded timeout of {_ripple_timeout}s "
+                        f"after {wave_count} waves"
+                    )
+                    _ripple_timed_out = True
+                    break
             wave_frac = wave_count / max(estimated_waves, 1)
-            logger.info(
-                f"[{run_id}] ━━━ Wave {wave_count + 1}/{estimated_waves} ━━━"
-            )
+            logger.info(f"[{run_id}] ━━━ Wave {wave_count + 1}/{estimated_waves} ━━━")
             # 增量记录：wave 启动前的场快照 / Incremental record: field snapshot before wave starts
             pre_snapshot = self._build_snapshot()
             if self._recorder:
@@ -633,14 +807,19 @@ class SimulationRuntime:
                 simulation_horizon=horizon_str,
             )
 
-            await self._emit(SimulationEvent(
-                type="wave_start", phase="RIPPLE", run_id=run_id,
-                progress=self._progress("RIPPLE", wave_frac),
-                wave=wave_count, total_waves=estimated_waves,
-                detail={
-                    "global_observation": verdict.global_observation,
-                },
-            ))
+            await self._emit(
+                SimulationEvent(
+                    type="wave_start",
+                    phase="RIPPLE",
+                    run_id=run_id,
+                    progress=self._progress("RIPPLE", wave_frac),
+                    wave=wave_count,
+                    total_waves=estimated_waves,
+                    detail={
+                        "global_observation": verdict.global_observation,
+                    },
+                )
+            )
 
             if not verdict.continue_propagation:
                 logger.info(
@@ -656,30 +835,33 @@ class SimulationRuntime:
                         post_snapshot=self._build_snapshot(),
                         terminated=True,
                     )
-                await self._emit(SimulationEvent(
-                    type="wave_end", phase="RIPPLE", run_id=run_id,
-                    progress=self._progress("RIPPLE", wave_frac),
-                    wave=wave_count, total_waves=estimated_waves,
-                    detail={
-                        "terminated": True,
-                        "reason": verdict.termination_reason
-                        or "全视者判定终止",
-                        "cas_signal": self._short_text(
-                            verdict.global_observation
-                            or verdict.termination_reason
-                            or "全视者判定终止",
-                            limit=120,
-                        ),
-                    },
-                ))
+                await self._emit(
+                    SimulationEvent(
+                        type="wave_end",
+                        phase="RIPPLE",
+                        run_id=run_id,
+                        progress=self._progress("RIPPLE", wave_frac),
+                        wave=wave_count,
+                        total_waves=estimated_waves,
+                        detail={
+                            "terminated": True,
+                            "reason": verdict.termination_reason or "全视者判定终止",
+                            "cas_signal": self._short_text(
+                                verdict.global_observation
+                                or verdict.termination_reason
+                                or "全视者判定终止",
+                                limit=120,
+                            ),
+                        },
+                    )
+                )
                 break
 
             # Wave 0 Sea 保护: CAS 中种子扰动必须到达至少一个群体 Agent
             # / Wave 0 Sea guard: in CAS, seed perturbation must reach at least one group (Sea) agent
             if wave_count == 0:
                 has_sea = any(
-                    a.agent_id in self._seas
-                    for a in verdict.activated_agents
+                    a.agent_id in self._seas for a in verdict.activated_agents
                 )
                 if not has_sea and self._seas:
                     first_sea_id = next(iter(self._seas))
@@ -693,29 +875,34 @@ class SimulationRuntime:
                             ),
                         )
                     )
-                    logger.warning(
-                        f"Wave 0 Sea guard: auto-injected {first_sea_id}"
-                    )
+                    logger.warning(f"Wave 0 Sea guard: auto-injected {first_sea_id}")
 
             # 通知每个被激活的 Agent / Notify each activated agent
             for activation in verdict.activated_agents:
                 aid = activation.agent_id
                 atype = "sea" if aid in self._seas else "star"
-                await self._emit(SimulationEvent(
-                    type="agent_activated", phase="RIPPLE", run_id=run_id,
-                    progress=self._progress("RIPPLE", wave_frac),
-                    wave=wave_count, total_waves=estimated_waves,
-                    agent_id=aid, agent_type=atype,
-                    detail={
-                        "energy": activation.incoming_ripple_energy,
-                        "agent_label": self._agent_label(aid),
-                        "activation_reason": activation.activation_reason,
-                    },
-                ))
+                await self._emit(
+                    SimulationEvent(
+                        type="agent_activated",
+                        phase="RIPPLE",
+                        run_id=run_id,
+                        progress=self._progress("RIPPLE", wave_frac),
+                        wave=wave_count,
+                        total_waves=estimated_waves,
+                        agent_id=aid,
+                        agent_type=atype,
+                        detail={
+                            "energy": activation.incoming_ripple_energy,
+                            "agent_label": self._agent_label(aid),
+                            "activation_reason": activation.activation_reason,
+                        },
+                    )
+                )
 
             # 并行激活被选中的 Agent / Activate selected agents in parallel
             responses = await self._activate_agents(
-                verdict, ripple_content=seed_ripple.content,
+                verdict,
+                ripple_content=seed_ripple.content,
             )
 
             # 通知每个 Agent 的响应 / Notify each agent's response
@@ -727,17 +914,25 @@ class SimulationRuntime:
                     or resp.get("reasoning")
                     or ""
                 )
-                await self._emit(SimulationEvent(
-                    type="agent_responded", phase="RIPPLE", run_id=run_id,
-                    progress=self._progress("RIPPLE", wave_frac),
-                    wave=wave_count, total_waves=estimated_waves,
-                    agent_id=aid, agent_type=atype,
-                    detail={
-                        **resp,
-                        "agent_label": self._agent_label(aid),
-                        "response_preview": self._short_text(response_preview, limit=120),
-                    },
-                ))
+                await self._emit(
+                    SimulationEvent(
+                        type="agent_responded",
+                        phase="RIPPLE",
+                        run_id=run_id,
+                        progress=self._progress("RIPPLE", wave_frac),
+                        wave=wave_count,
+                        total_waves=estimated_waves,
+                        agent_id=aid,
+                        agent_type=atype,
+                        detail={
+                            **resp,
+                            "agent_label": self._agent_label(aid),
+                            "response_preview": self._short_text(
+                                response_preview, limit=120
+                            ),
+                        },
+                    )
+                )
 
             # 记录本轮 / Record this wave
             record = WaveRecord(
@@ -785,30 +980,39 @@ class SimulationRuntime:
                 verdict.global_observation or "；".join(response_notes[:2]),
                 limit=120,
             )
-            await self._emit(SimulationEvent(
-                type="wave_end", phase="RIPPLE", run_id=run_id,
-                progress=self._progress("RIPPLE",
-                                        wave_count / max(estimated_waves, 1)),
-                wave=wave_count - 1, total_waves=estimated_waves,
-                detail={
-                    "agent_count": len(responses),
-                    "response_mix": response_mix,
-                    "cas_signal": cas_signal,
-                },
-            ))
-        else:
-            logger.warning(
-                f"[{run_id}] 达到安全上限 {max_waves} waves，强制终止"
+            await self._emit(
+                SimulationEvent(
+                    type="wave_end",
+                    phase="RIPPLE",
+                    run_id=run_id,
+                    progress=self._progress(
+                        "RIPPLE", wave_count / max(estimated_waves, 1)
+                    ),
+                    wave=wave_count - 1,
+                    total_waves=estimated_waves,
+                    detail={
+                        "agent_count": len(responses),
+                        "response_mix": response_mix,
+                        "cas_signal": cas_signal,
+                    },
+                )
             )
+        else:
+            logger.warning(f"[{run_id}] 达到安全上限 {max_waves} waves，强制终止")
 
         effective_waves = wave_count
 
-        await self._emit(SimulationEvent(
-            type="phase_end", phase="RIPPLE", run_id=run_id,
-            progress=self._progress("RIPPLE", 1.0),
-            wave=effective_waves - 1, total_waves=estimated_waves,
-            detail={"effective_waves": effective_waves},
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_end",
+                phase="RIPPLE",
+                run_id=run_id,
+                progress=self._progress("RIPPLE", 1.0),
+                wave=effective_waves - 1,
+                total_waves=estimated_waves,
+                detail={"effective_waves": effective_waves},
+            )
+        )
         # PMF v3+: build compressed evidence pack for downstream phases (DELIBERATE/OBSERVE/SYNTHESIZE)
         self._evidence_pack = self._build_evidence_pack()
         phase_context["effective_waves"] = effective_waves
@@ -825,11 +1029,15 @@ class SimulationRuntime:
 
         # Phase 3: OBSERVE
         logger.info(f"[{run_id}] ━━━ OBSERVE 阶段 ━━━")
-        await self._emit(SimulationEvent(
-            type="phase_start", phase="OBSERVE", run_id=run_id,
-            progress=self._progress("OBSERVE", 0.0),
-            total_waves=estimated_waves,
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_start",
+                phase="OBSERVE",
+                run_id=run_id,
+                progress=self._progress("OBSERVE", 0.0),
+                total_waves=estimated_waves,
+            )
+        )
         # v4.2: OBSERVE should explicitly incorporate DELIBERATE (if present)
         observe_history = "\n".join(history_lines)
         deliberate_output = self._extra_phase_outputs.get("DELIBERATE")
@@ -838,7 +1046,8 @@ class SimulationRuntime:
             if deliberation_summary is None:
                 # Fallback: include the whole output except raw records
                 deliberation_summary = {
-                    k: v for k, v in deliberate_output.items()
+                    k: v
+                    for k, v in deliberate_output.items()
                     if k != "deliberation_records"
                 }
             payload = {
@@ -853,23 +1062,31 @@ class SimulationRuntime:
                 + "\n\n===== END DELIBERATE SUMMARY =====\n"
             )
 
-        observation = await self._omniscient.observe(
-            field_snapshot=self._build_snapshot(),
-            full_history=observe_history,
+        observation = await self._run_phase(
+            self._omniscient.observe(
+                field_snapshot=self._build_snapshot(),
+                full_history=observe_history,
+            ),
+            phase_name="OBSERVE",
+            run_id=run_id,
         )
 
         # 增量记录：OBSERVE 阶段结果 / Incremental record: OBSERVE phase result
         if self._recorder:
             self._recorder.record_observation(observation)
 
-        await self._emit(SimulationEvent(
-            type="phase_end", phase="OBSERVE", run_id=run_id,
-            progress=self._progress("OBSERVE", 1.0),
-            total_waves=estimated_waves,
-            detail={
-                "observation_preview": observation,
-            },
-        ))
+        await self._emit(
+            SimulationEvent(
+                type="phase_end",
+                phase="OBSERVE",
+                run_id=run_id,
+                progress=self._progress("OBSERVE", 1.0),
+                total_waves=estimated_waves,
+                detail={
+                    "observation_preview": observation,
+                },
+            )
+        )
         phase_context["observation"] = observation
         phase_context["field_snapshot"] = self._build_snapshot()
         await self._run_extra_phases_between(
@@ -886,15 +1103,23 @@ class SimulationRuntime:
 
         # 合成结果 / Synthesize result
         logger.info(f"[{run_id}] ━━━ SYNTHESIZE 阶段 ━━━")
-        await self._emit(SimulationEvent(
-            type="phase_start", phase="SYNTHESIZE", run_id=run_id,
-            progress=self._progress("SYNTHESIZE", 0.0),
-            total_waves=estimated_waves,
-        ))
-        result = await self._omniscient.synthesize_result(
-            field_snapshot=self._build_snapshot(),
-            observation=observation,
-            simulation_input=simulation_input,
+        await self._emit(
+            SimulationEvent(
+                type="phase_start",
+                phase="SYNTHESIZE",
+                run_id=run_id,
+                progress=self._progress("SYNTHESIZE", 0.0),
+                total_waves=estimated_waves,
+            )
+        )
+        result = await self._run_phase(
+            self._omniscient.synthesize_result(
+                field_snapshot=self._build_snapshot(),
+                observation=observation,
+                simulation_input=simulation_input,
+            ),
+            phase_name="SYNTHESIZE",
+            run_id=run_id,
         )
 
         result["observation"] = observation
@@ -902,32 +1127,38 @@ class SimulationRuntime:
         result["run_id"] = run_id
         result["wave_records_count"] = len(self._wave_records)
 
+        # Propagate RIPPLE phase timeout marker to final result
+        if _ripple_timed_out:
+            result["timed_out"] = True
+            result["timeout_phase"] = "RIPPLE"
+
         # 增量记录：SYNTHESIZE 阶段结果（合成数据写入顶层键以保持向后兼容） / Incremental record: SYNTHESIZE result (top-level keys for backward compat)
         if self._recorder:
             self._recorder.record_synthesis(result)
 
-        logger.info(
-            f"[{run_id}] 模拟完成: {effective_waves} waves, "
-            f"LLM 调用链结束"
+        logger.info(f"[{run_id}] 模拟完成: {effective_waves} waves, LLM 调用链结束")
+        await self._emit(
+            SimulationEvent(
+                type="phase_end",
+                phase="SYNTHESIZE",
+                run_id=run_id,
+                progress=1.0,
+                total_waves=estimated_waves,
+                detail={
+                    "total_waves": effective_waves,
+                    "prediction_verdict": self._short_text(
+                        (
+                            result.get("prediction", {}).get("verdict")
+                            if isinstance(result.get("prediction"), dict)
+                            else result.get("prediction")
+                        )
+                        or result.get("prediction_verdict")
+                        or "",
+                        limit=160,
+                    ),
+                },
+            )
         )
-        await self._emit(SimulationEvent(
-            type="phase_end", phase="SYNTHESIZE", run_id=run_id,
-            progress=1.0,
-            total_waves=estimated_waves,
-            detail={
-                "total_waves": effective_waves,
-                "prediction_verdict": self._short_text(
-                    (
-                        result.get("prediction", {}).get("verdict")
-                        if isinstance(result.get("prediction"), dict)
-                        else result.get("prediction")
-                    )
-                    or result.get("prediction_verdict")
-                    or "",
-                    limit=160,
-                ),
-            },
-        ))
         return result
 
     def _create_agents(self, init_result: Dict[str, Any]) -> None:
@@ -937,6 +1168,7 @@ class SimulationRuntime:
         """
         # v4: Build skill context wrappers for star/sea
         from ripple.prompts import SKILL_CONTEXT_SEPARATOR, SKILL_CONTEXT_END
+
         star_skill = ""
         if self._skill_prompts.get("star"):
             star_skill = (
@@ -947,9 +1179,7 @@ class SimulationRuntime:
         sea_skill = ""
         if self._skill_prompts.get("sea"):
             sea_skill = (
-                SKILL_CONTEXT_SEPARATOR
-                + self._skill_prompts["sea"]
-                + SKILL_CONTEXT_END
+                SKILL_CONTEXT_SEPARATOR + self._skill_prompts["sea"] + SKILL_CONTEXT_END
             )
 
         for sc in init_result.get("star_configs", []):
@@ -968,19 +1198,17 @@ class SimulationRuntime:
             )
 
     async def _activate_agents(
-        self, verdict: OmniscientVerdict, ripple_content: str = "",
+        self,
+        verdict: OmniscientVerdict,
+        ripple_content: str = "",
     ) -> Dict[str, Dict[str, Any]]:
         """并行激活被裁决选中的 Agent。 / Activate verdict-selected agents in parallel."""
         known_ids = set(self._stars.keys()) | set(self._seas.keys())
         if verdict.activated_agents:
             activated_ids = [a.agent_id for a in verdict.activated_agents]
-            logger.info(
-                f"本轮激活 {len(activated_ids)} 个 Agent: {activated_ids}"
-            )
+            logger.info(f"本轮激活 {len(activated_ids)} 个 Agent: {activated_ids}")
         else:
-            logger.info(
-                f"本轮未激活任何 Agent（已注册: {list(known_ids)}）"
-            )
+            logger.info(f"本轮未激活任何 Agent（已注册: {list(known_ids)}）")
 
         tasks = {}
         for activation in verdict.activated_agents:
@@ -1005,13 +1233,13 @@ class SimulationRuntime:
         results = {}
         if tasks:
             done = await asyncio.gather(
-                *tasks.values(), return_exceptions=True,
+                *tasks.values(),
+                return_exceptions=True,
             )
             for aid, result in zip(tasks.keys(), done):
                 if isinstance(result, Exception):
                     logger.error(f"Agent {aid} 响应失败: {result}")
-                    results[aid] = {"response_type": "error",
-                                    "outgoing_energy": 0.0}
+                    results[aid] = {"response_type": "error", "outgoing_energy": 0.0}
                 else:
                     results[aid] = result
 
@@ -1063,8 +1291,7 @@ class SimulationRuntime:
             for phase_name, output in self._extra_phase_outputs.items():
                 if phase_name == "DELIBERATE" and isinstance(output, dict):
                     view[phase_name] = {
-                        k: v for k, v in output.items()
-                        if k != "deliberation_records"
+                        k: v for k, v in output.items() if k != "deliberation_records"
                     }
                     view[phase_name]["deliberation_records_ref"] = (
                         self._json_pointer_for_process_key("deliberation")
@@ -1129,13 +1356,15 @@ class SimulationRuntime:
                     or resp.get("reasoning")
                     or ""
                 )
-                signals.append({
-                    "wave_id": wave_id,
-                    "agent_id": aid,
-                    "response_type": rtype,
-                    "outgoing_energy": round(energy, 4),
-                    "signal": str(signal_text)[:160],
-                })
+                signals.append(
+                    {
+                        "wave_id": wave_id,
+                        "agent_id": aid,
+                        "response_type": rtype,
+                        "outgoing_energy": round(energy, 4),
+                        "signal": str(signal_text)[:160],
+                    }
+                )
 
         # Top signals by outgoing energy, cap at 10
         signals.sort(key=lambda x: float(x.get("outgoing_energy", 0.0)), reverse=True)
@@ -1167,7 +1396,9 @@ class SimulationRuntime:
         }
 
     def _build_history_with_window(
-        self, seed_line: str, window_size: int = 5,
+        self,
+        seed_line: str,
+        window_size: int = 5,
     ) -> str:
         """构建带滑动窗口的传播历史。 / Build propagation history with sliding window.
 
@@ -1187,15 +1418,13 @@ class SimulationRuntime:
             lines.append(summary)
 
         # 详细记录：最近 window_size 轮 / Detailed records: last window_size waves
-        recent_records = self._wave_records[max(0, cutoff):]
+        recent_records = self._wave_records[max(0, cutoff) :]
         # 计算每个 Agent 截止到详细窗口起始时的激活次数 / Count activations per agent before detail window
         counts_before: Dict[str, int] = {}
         if cutoff > 0:
             for record in self._wave_records[:cutoff]:
                 for act in record.verdict.activated_agents:
-                    counts_before[act.agent_id] = (
-                        counts_before.get(act.agent_id, 0) + 1
-                    )
+                    counts_before[act.agent_id] = counts_before.get(act.agent_id, 0) + 1
 
         running_counts = dict(counts_before)
         for record in recent_records:
@@ -1232,10 +1461,14 @@ class SimulationRuntime:
                 response_counts[rtype] = response_counts.get(rtype, 0) + 1
                 total_out_energy += resp.get("outgoing_energy", 0.0)
 
-        agent_parts = [f"{aid}×{cnt}" for aid, cnt in
-                       sorted(agent_counts.items(), key=lambda x: -x[1])]
-        resp_parts = [f"{rt}({cnt})" for rt, cnt in
-                      sorted(response_counts.items(), key=lambda x: -x[1])]
+        agent_parts = [
+            f"{aid}×{cnt}"
+            for aid, cnt in sorted(agent_counts.items(), key=lambda x: -x[1])
+        ]
+        resp_parts = [
+            f"{rt}({cnt})"
+            for rt, cnt in sorted(response_counts.items(), key=lambda x: -x[1])
+        ]
 
         return (
             f"Wave {first_wave}-{last_wave} 摘要: "

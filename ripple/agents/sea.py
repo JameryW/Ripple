@@ -12,7 +12,6 @@ Prompt 中显式引入群体内部差异性，避免 LLM 从众倾向过强（�
 / Explicitly introduces intra-group diversity in prompts to counter LLM conformity bias (per OASIS findings).
 """
 
-import json
 import logging
 from typing import Any, Callable, Awaitable, Dict, List
 
@@ -22,11 +21,16 @@ from ripple.prompts import (
     SEA_MEMORY_LINE,
     SEA_MEMORY_HEADER,
 )
+from ripple.utils.json_parser import parse_json_from_llm
 
 logger = logging.getLogger(__name__)
 
 VALID_SEA_RESPONSE_TYPES = {
-    "amplify", "absorb", "mutate", "suppress", "ignore",
+    "amplify",
+    "absorb",
+    "mutate",
+    "suppress",
+    "ignore",
 }
 FALLBACK_SEA_RESPONSE = {
     "response_type": "ignore",
@@ -65,7 +69,9 @@ class SeaAgent:
     ) -> Dict[str, Any]:
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(
-            ripple_content, ripple_energy, ripple_source,
+            ripple_content,
+            ripple_energy,
+            ripple_source,
         )
 
         for attempt in range(1 + self._max_retries):
@@ -79,19 +85,19 @@ class SeaAgent:
                     user_prompt=user_prompt,
                 )
                 response = self._parse_response(raw)
-                self.memory.append({
-                    "ripple_content": ripple_content,
-                    "ripple_source": ripple_source,
-                    "response": response,
-                })
+                self.memory.append(
+                    {
+                        "ripple_content": ripple_content,
+                        "ripple_source": ripple_source,
+                        "response": response,
+                    }
+                )
                 # 滑动窗口 / Sliding window
                 if len(self.memory) > self._memory_window:
-                    self.memory = self.memory[-self._memory_window:]
+                    self.memory = self.memory[-self._memory_window :]
                 return response
             except Exception as e:
-                logger.warning(
-                    f"海 Agent {self.agent_id} 第 {attempt+1} 次失败: {e}"
-                )
+                logger.warning(f"海 Agent {self.agent_id} 第 {attempt + 1} 次失败: {e}")
 
         return dict(FALLBACK_SEA_RESPONSE)
 
@@ -102,8 +108,8 @@ class SeaAgent:
             for m in self.memory:
                 lines.append(
                     SEA_MEMORY_LINE.format(
-                        ripple_source=m['ripple_source'],
-                        response_type=m['response']['response_type'],
+                        ripple_source=m["ripple_source"],
+                        response_type=m["response"]["response_type"],
                     )
                 )
             memory_context = SEA_MEMORY_HEADER + "\n".join(lines)
@@ -118,7 +124,10 @@ class SeaAgent:
         return base
 
     def _build_user_prompt(
-        self, content: str, energy: float, source: str,
+        self,
+        content: str,
+        energy: float,
+        source: str,
     ) -> str:
         return SEA_USER_PROMPT.format(
             source=source,
@@ -127,31 +136,18 @@ class SeaAgent:
         )
 
     def _parse_response(self, raw: str) -> Dict[str, Any]:
+        """Parse LLM response using robust JSON parser. / 使用 robust JSON parser 解析 LLM 响应。
+
+        Fix #3: Uses parse_json_from_llm() instead of simple json.loads() + fence stripping.
+        """
         if raw is None:
             raise ValueError("SeaAgent LLM response is None")
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         if not isinstance(raw, str):
-            raise TypeError(
-                f"SeaAgent expected str response, got {type(raw).__name__}"
-            )
+            raise TypeError(f"SeaAgent expected str response, got {type(raw).__name__}")
 
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith("```") and not in_block:
-                    in_block = True
-                    continue
-                elif line.strip() == "```" and in_block:
-                    break
-                elif in_block:
-                    json_lines.append(line)
-            text = "\n".join(json_lines)
-
-        data = json.loads(text)
+        data = parse_json_from_llm(raw)
         rtype = data.get("response_type", "ignore")
         if rtype not in VALID_SEA_RESPONSE_TYPES:
             rtype = "ignore"
