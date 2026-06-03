@@ -18,6 +18,31 @@ logger = logging.getLogger(__name__)
 FALLBACK_SCORES: Dict[str, int] = {}  # Empty fallback
 
 
+def _safe_int_score(value: Any, default: int = 3) -> int:
+    """安全地将评分值转为 int，兼容 float 字符串、dict、None 等异常类型。
+
+    LLM 有时返回非 int 评分（如 "4.0"、{"score": 3, "reason": "..."}、None），
+    直接 int(v) 会抛 TypeError/ValueError 导致整个 evaluate/revise 失败。
+    """
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except (ValueError, TypeError):
+            logger.warning(f"Cannot coerce score string: {value!r}, using default {default}")
+            return default
+    if isinstance(value, dict):
+        nested = value.get("score", value.get("value", default))
+        return _safe_int_score(nested, default)
+    logger.warning(f"Unexpected score type {type(value).__name__}: {value!r}, using default {default}")
+    return default
+
+
 class TribunalAgent:
     """合议庭评审员：专业角色评估器。 / Tribunal Agent: professional role evaluator."""
 
@@ -64,14 +89,14 @@ class TribunalAgent:
             try:
                 raw = await self._call_llm(prompt)
                 data = parse_json_from_llm(raw)
-                scores = {k: int(v) for k, v in data.get("scores", {}).items()}
+                scores = {k: _safe_int_score(v) for k, v in data.get("scores", {}).items()}
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
                     narrative=data.get("narrative", ""),
                     round_number=round_number,
                 )
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError) as e:
                 last_error = e
                 logger.warning(f"TribunalAgent {self.role} evaluate attempt {attempt + 1} failed: {e}")
 
@@ -124,14 +149,14 @@ class TribunalAgent:
             try:
                 raw = await self._call_llm(prompt)
                 data = parse_json_from_llm(raw)
-                scores = {k: int(v) for k, v in data.get("scores", {}).items()}
+                scores = {k: _safe_int_score(v) for k, v in data.get("scores", {}).items()}
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
                     narrative=data.get("narrative", ""),
                     round_number=round_number,
                 )
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError) as e:
                 last_error = e
                 logger.warning(f"TribunalAgent {self.role} revise attempt {attempt + 1} failed: {e}")
 
