@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
+- **Total Sessions**: 4
 - **Last Active**: 2026-06-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~107 | Active |
+| `journal-1.md` | ~141 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-06-05 | Provider Insights: surface provider usage in simulation output | `5eda19c`, `ebb1e60` | `main` |
 | 3 | 2026-06-05 | HistoricalProvider: fix tests, add post-validation, update spec | `f4325b5`, `8710049` | `main` |
 | 2 | 2026-06-05 | TopologyProvider 真实实现 | `5f3a8eb` | `main` |
 | 1 | 2026-06-05 | DataSource Provider abstraction layer | `0d0b75c` | `main` |

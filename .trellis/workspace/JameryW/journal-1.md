@@ -105,3 +105,37 @@ Fixed Wiki/Reddit provider test mocks (transport kwarg conflict), fixed MetricDe
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: Provider Insights: surface provider usage in simulation output
+
+**Date**: 2026-06-05
+**Task**: Provider Insights: surface provider usage in simulation output
+**Branch**: `main`
+
+### Summary
+
+Added top-level provider_insights to result dict showing provider activation status, records_injected, and validation results (summary + exceeded-only). Topology and historical validation reports now stored and serialized. Recorder writes process.providers. 30 tests. Spec updated with full output contract.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5eda19c` | (see git log) |
+| `ebb1e60` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
