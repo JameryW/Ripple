@@ -446,6 +446,18 @@ class RedditArchiveProvider:
 ### HistoricalValidator
 
 ```python
+@dataclass
+class MetricDeviation:
+    metric: str
+    predicted: float
+    historical_avg: float
+    historical_max: float
+    deviation_pct: float  # (predicted - avg) / avg * 100
+    threshold: float = 100.0  # max acceptable deviation %
+
+    @property
+    def is_acceptable(self) -> bool: ...  # uses self.threshold, NOT a parameter
+
 class HistoricalValidator:
     def __init__(self, threshold: float = 100.0): ...
     def validate(self, prediction: Dict, historical: List[Dict]) -> HistoricalValidationReport: ...
@@ -454,8 +466,11 @@ class HistoricalValidator:
 - Extracts numeric fields from prediction, computes historical averages
 - Compares each metric: `deviation_pct = (predicted - avg) / avg * 100`
 - Skips non-metric fields: `step`, `tick`, `t`, `phase`, `agent_id`, `id`, `timestamp`
+- `MetricDeviation.threshold` is a dataclass field (NOT a property parameter) — validator passes `self._threshold` when constructing each `MetricDeviation`
 - Logs only, never modifies prediction
 - Empty historical → warning in report
+
+> **Gotcha**: `MetricDeviation.is_acceptable` is a `@property` — Python properties cannot accept extra parameters. If threshold were a property parameter, it would be silently ignored at runtime. Threshold must be stored as a dataclass field and passed during construction.
 
 ### Pre-injection Integration
 
@@ -463,6 +478,13 @@ class HistoricalValidator:
 - If `simulation_input["historical"]` already has data → skip (user-provided takes priority)
 - If HistoricalProvider available and returns data → inject into `simulation_input["historical"]`
 - Non-fatal on exception
+
+### Post-validation Integration
+
+`SimulationRuntime._validate_historical()` called after SYNTHESIZE phase:
+- Validates `synthesize_result.get("prediction", {})` against `simulation_input["historical"]`
+- **Must pass `prediction` dict, not full `synthesize_result`** — validator's `_extract_numeric_fields` only inspects top-level numeric fields; the full result has nested structure (`prediction`, `timeline`, etc.)
+- Non-fatal on exception — logs warning and continues
 
 ### YAML Configuration
 
@@ -498,18 +520,30 @@ _providers:
 | `test_load_json` | FileHistoricalProvider loads JSON records |
 | `test_load_csv` | FileHistoricalProvider loads CSV records |
 | `test_load_json_with_records_key` | Handles `{"records": [...]}` wrapper |
+| `test_auto_format` | Format auto-detection from file extension |
+| `test_file_not_found` | Returns None, `is_available()` returns False |
 | `test_filter_by_platform` | Platform filtering works |
 | `test_filter_by_event_type` | Event type filtering works |
 | `test_limit` | Result count limited correctly |
+| `test_caching` | Second call uses cached records (`r1 == r2`, `_cache is not None`) |
 | `test_wiki_pageview_success` | WikiPageviewProvider parses API response |
 | `test_wiki_pageview_failure` | Returns None on network error |
+| `test_wiki_caching` | Cache hit: `call_count == 1` |
 | `test_reddit_archive_success` | RedditArchiveProvider parses API response |
 | `test_reddit_archive_failure` | Returns None on network error |
+| `test_reddit_size_capped` | Size capped at 100 |
 | `test_validate_identical` | Zero deviation for identical data |
-| `test_validate_deviation` | Detects metric deviation |
+| `test_validate_deviation` | Detects metric deviation (>100% threshold → not acceptable) |
 | `test_validate_no_historical` | Warning when no historical data |
+| `test_validate_no_matching_metric` | Empty metric_deviations when no overlap |
+| `test_validate_zero_historical_avg` | Acceptable when both predicted and avg are 0 |
+| `test_validate_infinite_deviation` | `deviation_pct == inf` when predicted > 0 and avg == 0 |
 | `test_validate_skip_non_numeric` | Skips step/tick/agent_id fields |
+| `test_report_log` | `report.log()` doesn't raise |
+| `test_custom_threshold` | Validator threshold actually used (200% threshold → acceptable) |
 | `test_yaml_config_file_provider` | Registry instantiates from YAML |
+| `test_yaml_file_provider_get_historical` | Registry provider returns data via `get_historical()` |
+| `test_lazy_import_resolves` | All three impls ("file", "wikipedia", "reddit") resolve |
 
 ### Design Decisions
 
@@ -530,3 +564,22 @@ _providers:
 **Context**: All providers need platform/event_type/limit filtering.
 **Decision**: Shared `_filter_records()` helper function.
 **Why**: DRY; consistent filtering behavior across all providers.
+
+#### Decision: httpx mock pattern for API providers
+
+**Context**: WikiPageviewProvider and RedditArchiveProvider use `httpx.AsyncClient`; tests need to mock HTTP calls.
+**Decision**: Use `patch("...httpx.AsyncClient", return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)))`.
+**Why**: `lambda **kw: httpx.AsyncClient(transport=..., **kw)` causes `transport` to be passed twice (once explicit, once via `**kw`), resulting in `TypeError: got multiple values for keyword argument 'transport'`. The `return_value=` pattern avoids this by creating the client once with the transport pre-injected.
+
+#### Decision: Post-validate prediction dict, not full synthesize_result
+
+**Context**: `_validate_historical()` receives the SYNTHESIZE phase result, but `HistoricalValidator._extract_numeric_fields` only looks at top-level numeric fields.
+**Decision**: Pass `synthesize_result.get("prediction", {})` to validator.
+**Why**: The full `synthesize_result` dict has nested structure (`prediction`, `timeline`, `wave_records`, etc.) — only the `prediction` sub-dict contains the metrics worth comparing against historical baselines.
+
+#### Common Mistake: @property with extra parameters
+
+**Symptom**: Custom threshold values silently ignored; validator always uses default 100%.
+**Cause**: Declaring `@property def is_acceptable(self, threshold: float = 100.0)` — Python properties cannot accept extra parameters; the `threshold` param is silently discarded at runtime.
+**Fix**: Make `threshold` a dataclass field on `MetricDeviation`, pass it during construction (`MetricDeviation(..., threshold=self._threshold)`).
+**Prevention**: Any `@property` that needs configurable behavior must store the config in the instance (field/attribute), not as a method parameter.
