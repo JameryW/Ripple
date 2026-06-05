@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "验证 Provider 注册、Protocol conformance、YAML 配置实例化"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "验证 Provider 异常 fallback 路径和非致命错误处理"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验证测试覆盖率、类型检查、代码质量"}
+{"file": ".trellis/tasks/06-05-historical-provider/research/historical-data-sources.md", "reason": "验证 API 返回 schema 和 record 映射正确性"}

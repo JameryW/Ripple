@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Provider Protocol 设计规范，HistoricalProvider 注册和集成模式参考"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Provider 异常 fallback 和 logging 规范"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Provider warning/info 日志规范"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试覆盖率和代码质量要求"}
+{"file": ".trellis/tasks/06-05-historical-provider/research/historical-data-sources.md", "reason": "Wiki Pageview API 和 Reddit Pushshift API 细节、record schema"}

@@ -189,8 +189,14 @@ class TestProtocolConformance:
     def test_stub_topology_is_provider(self):
         assert isinstance(StubTopologyProvider(), DataSourceProvider)
 
+    def test_stub_historical_is_provider(self):
+        assert isinstance(StubHistoricalProvider(), DataSourceProvider)
+
     def test_stub_embedding_is_provider(self):
         assert isinstance(StubEmbeddingProvider(), DataSourceProvider)
+
+    def test_stub_ambient_is_provider(self):
+        assert isinstance(StubAmbientProvider(), DataSourceProvider)
 
     def test_openai_embedding_is_provider(self):
         p = OpenAIEmbeddingProvider(url="https://api.example.com/v1", api_key="sk-test")
