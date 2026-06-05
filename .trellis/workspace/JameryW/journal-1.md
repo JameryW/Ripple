@@ -71,3 +71,37 @@ Implemented FileTopologyProvider (SNAP/JSON/GraphML/CSV/GML), SyntheticTopologyP
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: HistoricalProvider: fix tests, add post-validation, update spec
+
+**Date**: 2026-06-05
+**Task**: HistoricalProvider: fix tests, add post-validation, update spec
+**Branch**: `main`
+
+### Summary
+
+Fixed Wiki/Reddit provider test mocks (transport kwarg conflict), fixed MetricDeviation.threshold property bug (threshold silently ignored as @property param), added _validate_historical post-validation after SYNTHESIZE phase (passing prediction dict not full result), cleaned unused imports, added stub conformance tests, updated provider-architecture spec with learnings.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f4325b5` | (see git log) |
+| `8710049` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
