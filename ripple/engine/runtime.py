@@ -187,6 +187,8 @@ class SimulationRuntime:
         skill_prompts: Optional[Dict[str, str]] = None,
         # v2 Phase registration: Skills can register extra phases
         extra_phases: Optional[dict] = None,
+        # v5: DataSource Providers
+        providers: Optional[Any] = None,
     ):
         # v4: Build Omniscient system_prompt with skill context injection
         from ripple.prompts import SKILL_CONTEXT_SEPARATOR, SKILL_CONTEXT_END
@@ -217,6 +219,7 @@ class SimulationRuntime:
         self._skill_profile = skill_profile
         self._on_progress = on_progress
         self._recorder = recorder
+        self._providers = providers  # ProviderRegistry or None
         self._stars: Dict[str, StarAgent] = {}
         self._seas: Dict[str, SeaAgent] = {}
         self._wave_records: List[WaveRecord] = []
@@ -724,6 +727,21 @@ class SimulationRuntime:
         )
         self._seed_content = seed_content
         self._seed_energy = seed_energy
+
+        # Inject embedding via EmbeddingProvider if available
+        if self._providers is not None:
+            try:
+                from ripple.providers.registry import ProviderRegistry
+                if isinstance(self._providers, ProviderRegistry):
+                    emb_provider = self._providers.embedding
+                    if emb_provider.is_available():
+                        vec = await emb_provider.embed(seed_ripple.content)
+                        if vec is not None:
+                            seed_ripple.content_embedding = vec
+            except Exception as exc:
+                logger.warning(
+                    "EmbeddingProvider failed, leaving content_embedding empty: %s", exc
+                )
 
         # 增量记录：SEED 阶段结果 / Incremental record: SEED phase result
         if self._recorder:
