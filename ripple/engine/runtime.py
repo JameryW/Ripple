@@ -225,6 +225,8 @@ class SimulationRuntime:
         self._wave_records: List[WaveRecord] = []
         self._seed_content: str = ""
         self._seed_energy: float = 0.0
+        self._validation_reports: Dict[str, Any] = {}
+        self._historical_records_injected: int = 0
 
         # 构建阶段序列（支持 Skill 注册额外阶段）/ Build phase sequence (supports Skill extra phases)
         self._phases = self._build_phase_sequence(extra_phases)
@@ -1159,9 +1161,18 @@ class SimulationRuntime:
         # HistoricalProvider 后置校验 / Post-hoc historical validation
         await self._validate_historical(result, simulation_input, run_id)
 
+        # Build provider_insights from validation reports + provider state
+        insights = self._build_provider_insights(simulation_input)
+        # Always set provider_insights when providers are configured (even if empty dict);
+        # omit the key entirely when no providers were configured (backward compat)
+        if self._providers is not None:
+            result["provider_insights"] = insights
+
         # 增量记录：SYNTHESIZE 阶段结果（合成数据写入顶层键以保持向后兼容） / Incremental record: SYNTHESIZE result (top-level keys for backward compat)
         if self._recorder:
             self._recorder.record_synthesis(result)
+            if insights:
+                self._recorder.record_process("providers", insights)
 
         logger.info(f"[{run_id}] 模拟完成: {effective_waves} waves, LLM 调用链结束")
         await self._emit(
@@ -1224,6 +1235,7 @@ class SimulationRuntime:
                 run_id,
                 report.is_acceptable,
             )
+            self._validation_reports["topology"] = report
         except Exception as exc:
             logger.warning("Topology validation failed (non-fatal): %s", exc)
 
@@ -1241,7 +1253,9 @@ class SimulationRuntime:
             return
 
         if "historical" in simulation_input and simulation_input["historical"]:
-            return  # User provided historical data; don't override
+            # User provided historical data; don't override, but count existing records
+            self._historical_records_injected = len(simulation_input["historical"])
+            return
 
         try:
             records = await hist_provider.get_historical(
@@ -1250,6 +1264,7 @@ class SimulationRuntime:
             )
             if records:
                 simulation_input["historical"] = records
+                self._historical_records_injected = len(records)
                 logger.info(
                     "HistoricalProvider injected %d records for run %s",
                     len(records),
@@ -1286,8 +1301,199 @@ class SimulationRuntime:
                 run_id,
                 report.is_acceptable,
             )
+            self._validation_reports["historical"] = report
         except Exception as exc:
             logger.warning("Historical validation failed (non-fatal): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Provider Insights — build summary of provider usage for output
+    # ------------------------------------------------------------------
+
+    def _build_provider_insights(self, simulation_input: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a dict summarizing which providers were active and their validation results.
+
+        Returns an empty dict {} when all providers are stubs/unavailable.
+        """
+        insights: Dict[str, Any] = {}
+        providers = self._providers
+        if not providers:
+            return insights
+
+        stub_names = {
+            "StubTopologyProvider",
+            "StubHistoricalProvider",
+            "StubEmbeddingProvider",
+            "StubAmbientProvider",
+        }
+
+        for cat in ("topology", "historical", "embedding", "ambient"):
+            try:
+                p = getattr(providers, cat, None)
+            except Exception:
+                continue
+            if p is None:
+                continue
+            # Skip stub providers — they represent "no real provider configured"
+            if type(p).__name__ in stub_names:
+                continue
+            try:
+                available = p.is_available()
+            except Exception:
+                available = False
+            entry: Dict[str, Any] = {"available": available}
+
+            if cat == "historical":
+                records_injected = self._historical_records_injected
+                if records_injected > 0:
+                    entry["records_injected"] = records_injected
+
+            if cat in self._validation_reports:
+                try:
+                    entry["validation"] = self._serialize_validation(
+                        self._validation_reports[cat]
+                    )
+                except Exception:
+                    logger.warning("Failed to serialize validation report for %s", cat)
+
+            insights[cat] = entry
+
+        return insights
+
+    def _serialize_validation(self, report: Any) -> Dict[str, Any]:
+        """Serialize a validation report into the provider_insights schema.
+
+        Supports HistoricalValidationReport and topology ValidationReport.
+        """
+        from ripple.providers.historical_validator import HistoricalValidationReport
+        from ripple.providers.topology_validator import ValidationReport as TopologyValidationReport
+
+        if isinstance(report, HistoricalValidationReport):
+            deviations = report.metric_deviations
+            exceeded = [d for d in deviations if not d.is_acceptable]
+            max_dev = max(
+                (abs(d.deviation_pct) for d in deviations), default=0.0
+            )
+            return {
+                "acceptable": report.is_acceptable,
+                "deviation_count": len(deviations),
+                "max_deviation_pct": round(max_dev, 2),
+                "exceeded": [
+                    {
+                        "metric": d.metric,
+                        "predicted": d.predicted,
+                        "historical_avg": d.historical_avg,
+                        "deviation_pct": d.deviation_pct,
+                    }
+                    for d in exceeded
+                ],
+            }
+
+        if isinstance(report, TopologyValidationReport):
+            topo_exceeded: List[Dict[str, Any]] = []
+            if not report.scale.is_acceptable:
+                # Scale has two independent metrics (nodes, edges); emit each that exceeds threshold
+                topo_exceeded.extend(self._serialize_scale_checks(report.scale))
+            if not report.structure.is_acceptable:
+                topo_exceeded.append(self._serialize_topology_check("structure", report.structure))
+            if not report.type_dist.is_acceptable:
+                topo_exceeded.append(self._serialize_topology_check("type_dist", report.type_dist))
+            max_dev = max(
+                (
+                    abs(v)
+                    for v in [
+                        report.scale.node_deviation_pct,
+                        report.scale.edge_deviation_pct,
+                        report.type_dist.star_deviation_pct,
+                    ]
+                ),
+                default=0.0,
+            )
+            return {
+                "acceptable": report.is_acceptable,
+                "deviation_count": 3,  # topology has 3 sub-checks (scale, structure, type_dist)
+                "max_deviation_pct": round(max_dev, 2),
+                "exceeded": topo_exceeded,
+            }
+
+        # Unknown report type — return minimal info
+        is_acceptable = getattr(report, "is_acceptable", None)
+        return {
+            "acceptable": is_acceptable,
+            "deviation_count": 0,
+            "max_deviation_pct": 0.0,
+            "exceeded": [],
+        }
+
+    @staticmethod
+    def _serialize_scale_checks(scale: Any) -> List[Dict[str, Any]]:
+        """Serialize a ScaleCheck into one or two exceeded entries.
+
+        Scale has two independent metrics (node_count, edge_count).
+        Each that individually exceeds the threshold is emitted separately.
+        """
+        results: List[Dict[str, Any]] = []
+        if abs(scale.node_deviation_pct) > scale.threshold:
+            results.append({
+                "metric": "node_count",
+                "predicted": scale.llm_nodes,
+                "historical_avg": scale.provider_nodes,
+                "deviation_pct": scale.node_deviation_pct,
+            })
+        if abs(scale.edge_deviation_pct) > scale.threshold:
+            results.append({
+                "metric": "edge_count",
+                "predicted": scale.llm_edges,
+                "historical_avg": scale.provider_edges,
+                "deviation_pct": scale.edge_deviation_pct,
+            })
+        # If neither individually exceeds threshold but is_acceptable is False
+        # (shouldn't happen with current ScaleCheck logic, but be safe),
+        # emit the most deviated one.
+        if not results:
+            node_dev = abs(scale.node_deviation_pct)
+            edge_dev = abs(scale.edge_deviation_pct)
+            if node_dev >= edge_dev:
+                results.append({
+                    "metric": "node_count",
+                    "predicted": scale.llm_nodes,
+                    "historical_avg": scale.provider_nodes,
+                    "deviation_pct": scale.node_deviation_pct,
+                })
+            else:
+                results.append({
+                    "metric": "edge_count",
+                    "predicted": scale.llm_edges,
+                    "historical_avg": scale.provider_edges,
+                    "deviation_pct": scale.edge_deviation_pct,
+                })
+        return results
+
+    @staticmethod
+    def _serialize_topology_check(label: str, check: Any) -> Dict[str, Any]:
+        """Serialize a topology sub-check (StructCheck/TypeCheck) into exceeded format."""
+        if label == "structure":
+            return {
+                "metric": "connectivity",
+                "predicted": check.llm_connected,
+                "historical_avg": check.provider_connected,
+                "deviation_pct": 0.0,  # Not a percentage-based deviation
+            }
+
+        if label == "type_dist":
+            return {
+                "metric": "star_ratio",
+                "predicted": round(check.llm_star_ratio, 4),
+                "historical_avg": round(check.provider_star_ratio, 4),
+                "deviation_pct": check.star_deviation_pct,
+            }
+
+        # Fallback
+        return {
+            "metric": label,
+            "predicted": None,
+            "historical_avg": None,
+            "deviation_pct": 0.0,
+        }
 
     def _create_agents(self, init_result: Dict[str, Any]) -> None:
         """根据全视者 INIT 结果创建星海 Agent。 / Create Star/Sea agents from Omniscient INIT result.
