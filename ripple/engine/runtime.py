@@ -601,6 +601,9 @@ class SimulationRuntime:
         # 存储拓扑以供快照使用 / Store topology for snapshot use
         self._topology = init_result.get("topology")
 
+        # TopologyProvider 后置验证 / Post-hoc topology validation
+        await self._validate_topology(init_result, simulation_input, run_id)
+
         dp = init_result.get("dynamic_parameters", {})
         wave_time_window = dp.get("wave_time_window", "")
         wave_time_window_reasoning = str(dp.get("wave_time_window_reasoning", "") or "")
@@ -1178,6 +1181,45 @@ class SimulationRuntime:
             )
         )
         return result
+
+    async def _validate_topology(
+        self,
+        init_result: Dict[str, Any],
+        simulation_input: Dict[str, Any],
+        run_id: str,
+    ) -> None:
+        """Post-hoc validation: compare LLM topology with TopologyProvider data."""
+        providers = self._providers
+        if not providers or not hasattr(providers, "topology"):
+            return
+        topo_provider = providers.topology
+        if not topo_provider or not topo_provider.is_available():
+            return
+
+        llm_topology = init_result.get("topology")
+        if not llm_topology or not isinstance(llm_topology, dict):
+            return
+
+        try:
+            provider_topology = await topo_provider.get_topology(
+                skill_id=getattr(self, "_skill_id", None),
+                platform=simulation_input.get("event", {}).get("platform"),
+            )
+            if not provider_topology:
+                return
+
+            from ripple.providers.topology_validator import TopologyValidator
+            from ripple.providers.topology import TopologyData
+            validator = TopologyValidator()
+            report = validator.validate(TopologyData(llm_topology), provider_topology)
+            report.log()
+            logger.info(
+                "Topology validation complete for run %s — acceptable: %s",
+                run_id,
+                report.is_acceptable,
+            )
+        except Exception as exc:
+            logger.warning("Topology validation failed (non-fatal): %s", exc)
 
     def _create_agents(self, init_result: Dict[str, Any]) -> None:
         """根据全视者 INIT 结果创建星海 Agent。 / Create Star/Sea agents from Omniscient INIT result.

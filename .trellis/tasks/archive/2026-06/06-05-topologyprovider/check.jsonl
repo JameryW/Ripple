@@ -1,0 +1,7 @@
+{"role": "system", "text": "Verify TopologyProvider implementation against spec and prd.md acceptance criteria."}
+{"role": "user", "text": "Verify FileTopologyProvider loads all 5 formats (SNAP/JSON/GraphML/CSV/GML). Check NetworkX <3.4 'links' vs >=3.4 'edges' key handling."}
+{"role": "user", "text": "Verify SyntheticTopologyProvider generates all 4 models (BA/WS/SBM/ER). Check node type assignment (top-10% degree = star)."}
+{"role": "user", "text": "Verify TopologyValidator: scale/structure/type_dist checks, thresholds, logging only (no mutation). auto_correct raises NotImplementedError."}
+{"role": "user", "text": "Verify registry lazy import mechanism for topology providers. YAML config instantiation."}
+{"role": "user", "text": "Verify runtime.py integration: _validate_topology called after INIT, non-fatal on exception."}
+{"role": "user", "text": "Verify NetworkX optional: _HAS_NETWORKX flag, is_available() returns False, get_topology() returns None with warning."}

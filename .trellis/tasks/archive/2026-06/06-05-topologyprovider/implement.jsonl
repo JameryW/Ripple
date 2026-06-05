@@ -1,0 +1,6 @@
+{"role": "system", "text": "Implement TopologyProvider concrete classes and post-hoc validator per prd.md and spec."}
+{"role": "user", "text": "Create ripple/providers/topology_loaders.py with FileTopologyProvider (SNAP/JSON/GraphML/CSV/GML) and SyntheticTopologyProvider (BA/WS/SBM/ER). NetworkX optional dep, asyncio.to_thread() wrapping, caching."}
+{"role": "user", "text": "Create ripple/providers/topology_validator.py with TopologyValidator (scale/structure/type_dist checks), ValidationReport dataclass. Logs only, no LLM output modification."}
+{"role": "user", "text": "Register providers in registry.py _PROVIDER_LAZY_IMPORTS. Update __init__.py exports."}
+{"role": "user", "text": "Add _validate_topology() in runtime.py after INIT phase. Calls TopologyValidator when provider available."}
+{"role": "user", "text": "Add networkx>=3.0 as optional dependency in pyproject.toml."}
