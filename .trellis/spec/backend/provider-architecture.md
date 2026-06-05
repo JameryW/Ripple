@@ -583,3 +583,155 @@ _providers:
 **Cause**: Declaring `@property def is_acceptable(self, threshold: float = 100.0)` — Python properties cannot accept extra parameters; the `threshold` param is silently discarded at runtime.
 **Fix**: Make `threshold` a dataclass field on `MetricDeviation`, pass it during construction (`MetricDeviation(..., threshold=self._threshold)`).
 **Prevention**: Any `@property` that needs configurable behavior must store the config in the instance (field/attribute), not as a method parameter.
+
+---
+
+## Provider Insights (Output Contract)
+
+### Scope / Trigger
+
+- **Trigger**: Any change to `_build_provider_insights`, `_serialize_validation`, `_serialize_scale_checks`, `_serialize_topology_check`, or the `provider_insights` output schema.
+- **Cross-layer**: runtime.py → result dict → recorder JSON → API response
+
+### Signatures
+
+```python
+class SimulationRuntime:
+    def _build_provider_insights(self, simulation_input: Dict[str, Any]) -> Dict[str, Any]: ...
+    def _serialize_validation(self, report: Any) -> Dict[str, Any]: ...
+    @staticmethod
+    def _serialize_scale_checks(scale: Any) -> List[Dict[str, Any]]: ...
+    @staticmethod
+    def _serialize_topology_check(label: str, check: Any) -> Dict[str, Any]: ...
+```
+
+### Contracts
+
+#### Result dict: `provider_insights` (top-level key)
+
+```json
+{
+  "provider_insights": {
+    "topology": {
+      "available": true,
+      "validation": {
+        "acceptable": false,
+        "deviation_count": 3,
+        "max_deviation_pct": 45.2,
+        "exceeded": [
+          {"metric": "node_count", "predicted": 200, "historical_avg": 110, "deviation_pct": 81.8}
+        ]
+      }
+    },
+    "historical": {
+      "available": true,
+      "records_injected": 15,
+      "validation": {
+        "acceptable": true,
+        "deviation_count": 2,
+        "max_deviation_pct": 35.4,
+        "exceeded": []
+      }
+    }
+  }
+}
+```
+
+#### Key rules
+
+| Rule | Behavior |
+|------|----------|
+| All providers are stubs | `provider_insights` = `{}` (empty dict, not omitted) |
+| No providers configured | `provider_insights` key omitted entirely (backward compat) |
+| `records_injected` = 0 | Field omitted from historical sub-dict |
+| `exceeded` empty | Returns `[]` (not omitted) |
+| Validation report unavailable | `validation` key omitted from provider sub-dict |
+| `_serialize_validation` fails | `logger.warning` + `validation` key omitted |
+
+#### Recorder: `process.providers`
+
+When `provider_insights` is non-empty, recorder writes via `record_process("providers", insights)`, creating the `process.providers` key in the JSON output.
+
+### Validation & Error Matrix
+
+| Condition | Behavior |
+|-----------|----------|
+| Provider `is_available()` raises exception | `available = False` in insights, continues |
+| `_serialize_validation()` raises exception | `logger.warning`, `validation` key omitted |
+| `_build_provider_insights()` raises exception | `provider_insights` = `{}` (safe fallback) |
+| Provider is a stub (StubXxxProvider) | Skipped — not included in insights |
+
+### Good / Base / Bad Cases
+
+#### Good: Historical provider with data and acceptable validation
+
+```json
+{"provider_insights": {"historical": {"available": true, "records_injected": 15, "validation": {"acceptable": true, "deviation_count": 2, "max_deviation_pct": 35.4, "exceeded": []}}}}
+```
+
+#### Base: No providers configured (backward compat)
+
+```json
+// provider_insights key omitted entirely — existing consumers unaffected
+```
+
+#### Bad: Validation exceeds threshold
+
+```json
+{"provider_insights": {"historical": {"available": true, "records_injected": 10, "validation": {"acceptable": false, "deviation_count": 3, "max_deviation_pct": 354.5, "exceeded": [{"metric": "views", "predicted": 5000, "historical_avg": 1100, "deviation_pct": 354.5}]}}}}
+```
+
+### Tests Required
+
+| Test | Assertion Point |
+|------|-----------------|
+| `test_no_providers_returns_empty` | `_build_provider_insights` returns `{}` |
+| `test_all_stubs_returns_empty` | Stub providers skipped, returns `{}` |
+| `test_available_historical_provider` | Entry has `available: True` |
+| `test_records_injected_zero_not_shown` | `records_injected` omitted when 0 |
+| `test_validation_report_included` | `validation` sub-dict present |
+| `test_exception_on_is_available_handled` | `available: False` on exception |
+| `test_historical_report_acceptable` | `exceeded: []` when all within threshold |
+| `test_historical_report_with_exceeded` | `exceeded` list contains over-threshold metrics only |
+| `test_topology_report_with_exceeded_scale` | Scale deviations in `exceeded` |
+| `test_topology_report_with_exceeded_scale_both` | Both node_count and edge_count in `exceeded` when both exceed threshold |
+| `test_no_providers_omits_key` | Result dict has no `provider_insights` key |
+| `test_all_stubs_produces_empty_dict` | `provider_insights = {}` |
+| `test_result_dict_keys_preserved` | Existing keys unchanged |
+| `test_no_providers_no_extra_keys` | No unexpected keys added |
+
+### Wrong vs Correct
+
+#### Wrong: Validation report includes all deviations regardless of threshold
+
+```python
+exceeded = [d for d in report.metric_deviations]  # includes acceptable ones too
+```
+
+#### Correct: Only exceeded deviations (over threshold)
+
+```python
+exceeded = [d for d in report.metric_deviations if not d.is_acceptable]
+```
+
+### Design Decisions
+
+#### Decision: Top-level `provider_insights` key (not nested)
+
+**Context**: Where should provider usage data appear in the result dict?
+**Options**: (1) Top-level `provider_insights`, (2) `meta.providers`, (3) `process.providers`
+**Decision**: Top-level `provider_insights` — easiest to discover and consume; same tier as `prediction`.
+**Why**: Nested locations (`meta`, `process`) are less visible to API consumers. Top-level mirrors how other high-value outputs (prediction, timeline) are structured.
+
+#### Decision: Summary + exceeded-only validation detail
+
+**Context**: How much validation detail should be in the output?
+**Options**: (1) Summary only, (2) Full report, (3) Summary + exceeded-only
+**Decision**: Summary + exceeded-only — `acceptable/deviation_count/max_deviation_pct/exceeded[]`.
+**Why**: Full reports bloat output when normal; exceeded-only provides actionable detail when something is wrong. `exceeded` is empty `[]` when all metrics are acceptable — no wasted space.
+
+#### Decision: Empty dict `{}` for stub-only, omit key for no providers
+
+**Context**: What should `provider_insights` be when providers are stubs or not configured?
+**Decision**: All stubs → `{}` (explicit "checked, nothing active"). No providers configured → key omitted (backward compat — existing consumers don't see new key).
+**Why**: Two different states need two different representations. `{}` means "providers were configured but none were active"; omitted means "no providers at all, same as before".
