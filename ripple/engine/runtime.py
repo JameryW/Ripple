@@ -547,6 +547,9 @@ class SimulationRuntime:
         run_id: str,
     ) -> Dict[str, Any]:
         """Inner simulation logic, called by run() with optional job timeout."""
+        # HistoricalProvider 预注入 / Pre-inject historical data from provider
+        await self._inject_historical(simulation_input, run_id)
+
         phase_context: Dict[str, Any] = {
             "run_id": run_id,
             "simulation_input": simulation_input,
@@ -1220,6 +1223,37 @@ class SimulationRuntime:
             )
         except Exception as exc:
             logger.warning("Topology validation failed (non-fatal): %s", exc)
+
+    async def _inject_historical(
+        self,
+        simulation_input: Dict[str, Any],
+        run_id: str,
+    ) -> None:
+        """Pre-inject historical data from HistoricalProvider into simulation_input."""
+        providers = self._providers
+        if not providers or not hasattr(providers, "historical"):
+            return
+        hist_provider = providers.historical
+        if not hist_provider or not hist_provider.is_available():
+            return
+
+        if "historical" in simulation_input and simulation_input["historical"]:
+            return  # User provided historical data; don't override
+
+        try:
+            records = await hist_provider.get_historical(
+                skill_id=getattr(self, "_skill_id", None),
+                platform=simulation_input.get("event", {}).get("platform"),
+            )
+            if records:
+                simulation_input["historical"] = records
+                logger.info(
+                    "HistoricalProvider injected %d records for run %s",
+                    len(records),
+                    run_id,
+                )
+        except Exception as exc:
+            logger.warning("HistoricalProvider injection failed (non-fatal): %s", exc)
 
     def _create_agents(self, init_result: Dict[str, Any]) -> None:
         """根据全视者 INIT 结果创建星海 Agent。 / Create Star/Sea agents from Omniscient INIT result.

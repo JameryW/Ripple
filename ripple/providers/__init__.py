@@ -8,10 +8,16 @@ from .openai_embedding import OpenAIEmbeddingProvider
 from .registry import ProviderRegistry, register_provider
 from .topology import TopologyData, TopologyEdge, TopologyNode, TopologyProvider, StubTopologyProvider
 
-# Optional-dependency providers (require networkx)
+# Optional-dependency providers
 try:
     from .topology_loaders import FileTopologyProvider, SyntheticTopologyProvider
     from .topology_validator import TopologyValidator, ValidationReport
+except ImportError:
+    pass
+
+try:
+    from .historical_loaders import FileHistoricalProvider, WikiPageviewProvider, RedditArchiveProvider
+    from .historical_validator import HistoricalValidator, HistoricalValidationReport
 except ImportError:
     pass
 
@@ -19,10 +25,14 @@ __all__ = [
     "AmbientProvider",
     "DataSourceProvider",
     "EmbeddingProvider",
+    "FileHistoricalProvider",
     "FileTopologyProvider",
     "HistoricalProvider",
+    "HistoricalValidator",
+    "HistoricalValidationReport",
     "OpenAIEmbeddingProvider",
     "ProviderRegistry",
+    "RedditArchiveProvider",
     "StubAmbientProvider",
     "StubEmbeddingProvider",
     "StubHistoricalProvider",
@@ -34,5 +44,6 @@ __all__ = [
     "TopologyProvider",
     "TopologyValidator",
     "ValidationReport",
+    "WikiPageviewProvider",
     "register_provider",
 ]

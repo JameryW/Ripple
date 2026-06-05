@@ -21,6 +21,11 @@ _PROVIDER_LAZY_IMPORTS: Dict[str, Dict[str, tuple]] = {
         "file": ("ripple.providers.topology_loaders", "FileTopologyProvider"),
         "synthetic": ("ripple.providers.topology_loaders", "SyntheticTopologyProvider"),
     },
+    "historical": {
+        "file": ("ripple.providers.historical_loaders", "FileHistoricalProvider"),
+        "wikipedia": ("ripple.providers.historical_loaders", "WikiPageviewProvider"),
+        "reddit": ("ripple.providers.historical_loaders", "RedditArchiveProvider"),
+    },
 }
 
 logger = logging.getLogger(__name__)
