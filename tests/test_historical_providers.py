@@ -123,7 +123,9 @@ class TestFileHistoricalProvider:
         provider = FileHistoricalProvider(json_historical_file, format="json")
         r1 = await provider.get_historical()
         r2 = await provider.get_historical()
-        assert r1 is r2
+        # _filter_records returns a new list each call, but underlying cache is reused
+        assert r1 == r2
+        assert provider._cache is not None  # Cache populated
 
     def test_name(self, json_historical_file: Path):
         provider = FileHistoricalProvider(json_historical_file)
