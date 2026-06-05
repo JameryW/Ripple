@@ -270,6 +270,8 @@ async def simulate(
     ensemble_runs: int = 1,
     deliberation_rounds: int = 3,
     redact_input: bool = False,
+    # --- v5: DataSource Providers ---
+    providers: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """一键模拟（通用输入协议）。
 
@@ -313,6 +315,10 @@ async def simulate(
         ensemble_runs: 集成运行次数（默认 1）。共享同一 BudgetState，不倍增预算。
         deliberation_rounds: 合议庭总轮数（含 Round 1 独立评估），服务端上限 4。
         redact_input: 是否对落盘输入进行脱敏（默认 False）。
+        providers: DataSource Provider 注入（v5）。支持两种格式：
+            - ProviderRegistry 实例：直接使用
+            - Dict[str, DataSourceProvider]：作为运行时覆盖创建 ProviderRegistry
+            优先级：运行时参数 > llm_config.yaml _providers 配置 > Stub（LLM 回退）
 
     返回：
         模拟结果字典，包含 output_file 和 disclaimer 字段。
@@ -518,7 +524,48 @@ async def simulate(
     else:
         recorder.record_simulation_input(simulation_input)
 
-    # 10. 执行模拟（单次或集成模式）
+    # 10. Resolve providers registry
+    from ripple.providers.registry import ProviderRegistry
+    _providers_registry: Optional[ProviderRegistry] = None
+
+    # 10a. Load YAML-declared providers from llm_config.yaml (if present)
+    _yaml_providers_cfg: Dict[str, Any] = {}
+    _file_config = getattr(router.config_loader, "_file_config", None)
+    if isinstance(_file_config, dict):
+        _yaml_providers_cfg = _file_config.get("_providers", {})
+
+    # 10b. Auto-load providers declared by skill's required_providers
+    _skill_required = getattr(loaded_skill, "required_providers", []) or []
+
+    # 10c. Build registry with priority: runtime overrides > YAML defaults > stubs
+    if isinstance(providers, ProviderRegistry):
+        # Caller provided a fully-constructed registry — use as-is
+        _providers_registry = providers
+    elif providers is not None or _yaml_providers_cfg or _skill_required:
+        # Build from YAML defaults + runtime overrides
+        _providers_registry = ProviderRegistry(
+            yaml_providers_cfg=_yaml_providers_cfg,
+            runtime_overrides=providers if isinstance(providers, dict) else None,
+        )
+
+    # 10d. Validate skill-required providers are available
+    if _skill_required and _providers_registry is not None:
+        for cat in _skill_required:
+            try:
+                p = _providers_registry.get(cat)
+                if not p.is_available():
+                    logger.warning(
+                        "Skill '%s' requires provider '%s' but it is not available — "
+                        "simulation will use LLM fallback",
+                        loaded_skill.name, cat,
+                    )
+            except KeyError:
+                logger.warning(
+                    "Skill '%s' requires provider '%s' but no such provider category exists",
+                    loaded_skill.name, cat,
+                )
+
+    # 12. 执行模拟（单次或集成模式）
     try:
         if ensemble_runs <= 1:
             # 单次模拟（原有行为） / Single run (existing behavior)
@@ -533,6 +580,7 @@ async def simulate(
                 extra_phases=extra_phases,
                 simulation_input=simulation_input,
                 run_id=run_id,
+                providers=_providers_registry,
             )
         else:
             # 集成模式 — 共享预算，不倍增 / Ensemble mode — shared budget, no multiplication
@@ -549,6 +597,7 @@ async def simulate(
                 run_id=run_id,
                 ensemble_runs=ensemble_runs,
                 random_seed=random_seed,
+                providers=_providers_registry,
             )
 
         # 记录器完成最终写入
@@ -567,7 +616,7 @@ async def simulate(
         requested_max_calls=max_llm_calls,
     )
 
-    # 11. 强制免责声明注入 / Mandatory disclaimer injection
+    # 13. 强制免责声明注入 / Mandatory disclaimer injection
     result["disclaimer"] = _DISCLAIMER
 
     logger.info(
@@ -588,6 +637,7 @@ async def _run_single_simulation(
     extra_phases,
     simulation_input,
     run_id,
+    providers=None,
 ) -> Dict[str, Any]:
     """执行单次模拟。 / Run a single simulation."""
     runtime = SimulationRuntime(
@@ -599,6 +649,7 @@ async def _run_single_simulation(
         on_progress=on_progress,
         recorder=recorder,
         extra_phases=extra_phases,
+        providers=providers,
     )
     return await runtime.run(simulation_input, run_id=run_id)
 
@@ -617,6 +668,7 @@ async def _run_ensemble(
     run_id,
     ensemble_runs: int,
     random_seed: Optional[int],
+    providers=None,
 ) -> Dict[str, Any]:
     """执行集成模拟（多次运行 + 聚合）。 / Run ensemble simulation (multiple runs + aggregation).
 
@@ -697,6 +749,7 @@ async def _run_ensemble(
                 on_progress=on_progress,
                 recorder=recorder,
                 extra_phases=extra_phases,
+                providers=providers,
             )
             inp = dict(simulation_input)
             inp["random_seed"] = seed

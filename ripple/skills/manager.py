@@ -105,6 +105,9 @@ class LoadedSkill:
     # 原始 frontmatter 元数据 / Raw frontmatter metadata
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    # v5: Skill 声明所需的 Provider 类别 / Provider categories declared by this skill
+    required_providers: List[str] = field(default_factory=list)
+
 
 # =============================================================================
 # SkillManager — Skill 发现、加载与管理 / Skill discovery, loading & management
@@ -498,6 +501,8 @@ class SkillManager:
             channel_labels=_label_map("channel_labels"),
             vertical_profiles=vertical_profiles,
             vertical_labels=_label_map("vertical_labels"),
+            # v5: Provider categories declared by this skill
+            required_providers=frontmatter.get("required_providers", []),
             # 保留完整 frontmatter，供 CLI 读取 use_when 等元信息。
             # Keep the full frontmatter so CLI can read use_when and similar metadata.
             meta=dict(frontmatter),
