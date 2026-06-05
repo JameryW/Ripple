@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +22,13 @@ class MetricDeviation:
     historical_avg: float
     historical_max: float
     deviation_pct: float  # (predicted - avg) / avg * 100
+    threshold: float = 100.0  # max acceptable deviation %
 
     @property
-    def is_acceptable(self, threshold: float = 100.0) -> bool:
+    def is_acceptable(self) -> bool:
         if self.historical_avg == 0:
             return self.predicted == 0
-        return abs(self.deviation_pct) <= threshold
+        return abs(self.deviation_pct) <= self.threshold
 
 
 @dataclass
@@ -105,6 +106,7 @@ class HistoricalValidator:
                 historical_avg=round(avg, 2),
                 historical_max=round(max_val, 2),
                 deviation_pct=round(dev, 2),
+                threshold=self._threshold,
             ))
 
         return HistoricalValidationReport(

@@ -10,11 +10,9 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import httpx
-
-from .historical import HistoricalProvider
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +264,7 @@ class RedditArchiveProvider:
 
     async def health_check(self) -> bool:
         try:
-            params = {"subreddit": self._subreddit, "size": 1}
+            params: Dict[str, str | int] = {"subreddit": self._subreddit, "size": 1}
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(self._BASE_URL, params=params, headers={"User-Agent": "Ripple/0.1"})
                 return resp.status_code == 200
@@ -284,7 +282,7 @@ class RedditArchiveProvider:
         if self._cache is not None:
             return _filter_records(self._cache, platform=platform, event_type=event_type, limit=limit)
 
-        params = {
+        params: Dict[str, str | int] = {
             "subreddit": self._subreddit,
             "size": self._size,
             "sort_type": self._sort_type,

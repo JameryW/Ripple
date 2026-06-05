@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -16,11 +15,7 @@ from ripple.providers.historical_loaders import (
     WikiPageviewProvider,
     _filter_records,
 )
-from ripple.providers.historical_validator import (
-    HistoricalValidationReport,
-    HistoricalValidator,
-    MetricDeviation,
-)
+from ripple.providers.historical_validator import HistoricalValidator
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +162,7 @@ class TestWikiPageviewProvider:
 
         with patch(
             "ripple.providers.historical_loaders.httpx.AsyncClient",
-            lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw),
+            return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ):
             provider = WikiPageviewProvider(article="Test")
             result = await provider.get_historical()
@@ -185,7 +180,7 @@ class TestWikiPageviewProvider:
 
         with patch(
             "ripple.providers.historical_loaders.httpx.AsyncClient",
-            lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw),
+            return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ):
             provider = WikiPageviewProvider(article="Test")
             result = await provider.get_historical()
@@ -205,12 +200,14 @@ class TestWikiPageviewProvider:
 
         with patch(
             "ripple.providers.historical_loaders.httpx.AsyncClient",
-            lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw),
+            return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ):
             provider = WikiPageviewProvider(article="Test")
             r1 = await provider.get_historical()
             r2 = await provider.get_historical()
-            assert r1 is r2
+            # _filter_records returns a new list each call, but underlying cache is reused
+            assert r1 == r2
+            assert provider._cache is not None
             assert call_count == 1
 
 
@@ -244,7 +241,7 @@ class TestRedditArchiveProvider:
 
         with patch(
             "ripple.providers.historical_loaders.httpx.AsyncClient",
-            lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw),
+            return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ):
             provider = RedditArchiveProvider(subreddit="technology")
             result = await provider.get_historical()
@@ -262,7 +259,7 @@ class TestRedditArchiveProvider:
 
         with patch(
             "ripple.providers.historical_loaders.httpx.AsyncClient",
-            lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw),
+            return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ):
             provider = RedditArchiveProvider(subreddit="technology")
             result = await provider.get_historical()

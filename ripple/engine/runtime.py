@@ -1156,6 +1156,9 @@ class SimulationRuntime:
             result["timed_out"] = True
             result["timeout_phase"] = "RIPPLE"
 
+        # HistoricalProvider 后置校验 / Post-hoc historical validation
+        await self._validate_historical(result, simulation_input, run_id)
+
         # 增量记录：SYNTHESIZE 阶段结果（合成数据写入顶层键以保持向后兼容） / Incremental record: SYNTHESIZE result (top-level keys for backward compat)
         if self._recorder:
             self._recorder.record_synthesis(result)
@@ -1254,6 +1257,37 @@ class SimulationRuntime:
                 )
         except Exception as exc:
             logger.warning("HistoricalProvider injection failed (non-fatal): %s", exc)
+
+    async def _validate_historical(
+        self,
+        synthesize_result: Dict[str, Any],
+        simulation_input: Dict[str, Any],
+        run_id: str,
+    ) -> None:
+        """Post-hoc validation: compare LLM SYNTHESIZE prediction with HistoricalProvider data."""
+        providers = self._providers
+        if not providers or not hasattr(providers, "historical"):
+            return
+        hist_provider = providers.historical
+        if not hist_provider or not hist_provider.is_available():
+            return
+
+        historical = simulation_input.get("historical")
+        if not historical or not isinstance(historical, list):
+            return
+
+        try:
+            from ripple.providers.historical_validator import HistoricalValidator
+            validator = HistoricalValidator()
+            report = validator.validate(synthesize_result.get("prediction", {}), historical)
+            report.log()
+            logger.info(
+                "Historical validation complete for run %s — acceptable: %s",
+                run_id,
+                report.is_acceptable,
+            )
+        except Exception as exc:
+            logger.warning("Historical validation failed (non-fatal): %s", exc)
 
     def _create_agents(self, init_result: Dict[str, Any]) -> None:
         """根据全视者 INIT 结果创建星海 Agent。 / Create Star/Sea agents from Omniscient INIT result.
