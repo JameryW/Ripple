@@ -15,6 +15,14 @@ from .historical import HistoricalProvider, StubHistoricalProvider
 from .openai_embedding import OpenAIEmbeddingProvider
 from .topology import TopologyProvider, StubTopologyProvider
 
+# Lazy imports for optional-dependency providers (networkx required)
+_PROVIDER_LAZY_IMPORTS: Dict[str, Dict[str, tuple]] = {
+    "topology": {
+        "file": ("ripple.providers.topology_loaders", "FileTopologyProvider"),
+        "synthetic": ("ripple.providers.topology_loaders", "SyntheticTopologyProvider"),
+    },
+}
+
 logger = logging.getLogger(__name__)
 
 _PROVIDER_MAP: Dict[str, type] = {
@@ -26,11 +34,30 @@ _PROVIDER_MAP: Dict[str, type] = {
 
 # Forward-reference: will be populated when concrete providers are implemented
 _PROVIDER_IMPLEMENTATIONS: Dict[str, Dict[str, type]] = {
-    "topology": {},
+    "topology": {},  # Populated lazily from _PROVIDER_LAZY_IMPORTS
     "historical": {},
     "embedding": {"openai": OpenAIEmbeddingProvider},
     "ambient": {},
 }
+
+
+def _ensure_lazy_imports(category: str) -> None:
+    """Eagerly import lazy-registered provider classes for *category*."""
+    lazy = _PROVIDER_LAZY_IMPORTS.get(category, {})
+    if not lazy:
+        return
+    for impl_name, (module_path, class_name) in lazy.items():
+        if impl_name in _PROVIDER_IMPLEMENTATIONS.get(category, {}):
+            continue
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            _PROVIDER_IMPLEMENTATIONS[category][impl_name] = cls
+        except Exception:
+            logger.debug("Lazy import failed for %s.%s: skipped", module_path, class_name)
+    # Mark as resolved (clear lazy entries)
+    _PROVIDER_LAZY_IMPORTS.pop(category, None)
 
 
 def register_provider(category: str, impl_name: str, cls: type) -> None:
@@ -94,6 +121,9 @@ class ProviderRegistry:
             if not impl_name:
                 logger.warning("No 'impl' key for provider %s — skipping", category)
                 continue
+
+            # Ensure lazy imports are resolved for this category
+            _ensure_lazy_imports(category)
 
             impls = _PROVIDER_IMPLEMENTATIONS.get(category, {})
             cls = impls.get(impl_name)
