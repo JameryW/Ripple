@@ -1,17 +1,18 @@
-"""Ripple 集中式提示词管理模块。
-Centralized prompt management module for Ripple.
+import json
 
-本文件统一管理 Ripple 系统中所有 Agent 使用的 LLM 提示词模板。
-每个提示词均标注了调用位置和用途，方便后续优化管理。
-This file manages all LLM prompt templates used by Ripple agents.
-Each prompt is annotated with its call site and purpose for easy maintenance.
-
-提示词分类 / Prompt Categories:
-1. 全视者 (Omniscient) 提示词 —— INIT / RIPPLE / OBSERVE / SYNTHESIZE 各阶段
-2. 星 Agent (Star) 提示词 —— KOL 个体行为模拟
-3. 海 Agent (Sea) 提示词 —— 群体行为模拟
-4. 通用提示词 —— 重试、错误处理等
-"""
+# Ripple 集中式提示词管理模块。
+# Centralized prompt management module for Ripple.
+#
+# 本文件统一管理 Ripple 系统中所有 Agent 使用的 LLM 提示词模板。
+# 每个提示词均标注了调用位置和用途，方便后续优化管理。
+# This file manages all LLM prompt templates used by Ripple agents.
+# Each prompt is annotated with its call site and purpose for easy maintenance.
+#
+# 提示词分类 / Prompt Categories:
+# 1. 全视者 (Omniscient) 提示词 —— INIT / RIPPLE / OBSERVE / SYNTHESIZE 各阶段
+# 2. 星 Agent (Star) 提示词 —— KOL 个体行为模拟
+# 3. 海 Agent (Sea) 提示词 —— 群体行为模拟
+# 4. 通用提示词 —— 重试、错误处理等
 
 # =============================================================================
 # 通用提示词 / Common Prompts
@@ -476,6 +477,62 @@ OMNISCIENT_INIT_TOPOLOGY_USER = (
     "## 模拟请求\n\n{input_json}\n\n"
     "## 已确定的动态参数\n\n{dp_json}\n\n"
     "## 已确定的 Agent 配置\n\n{agents_json}\n\n"
+)
+
+
+# --- INIT:merged ---
+# 调用位置 / Call site: omniscient.py — _build_init_merged_prompt()
+# 用途 / Purpose: 合并模式 — 1 次 LLM 调用完成 dynamics + agents + topology + seed
+#       Merged mode: complete dynamics + agents + topology + seed in 1 LLM call
+OMNISCIENT_INIT_MERGED_SYSTEM_TEMPLATE = (
+    "## 你的任务\n\n"
+    "请完成以下三步初始化任务，一次性输出所有结果：\n\n"
+    "**第一步：场景时间分析**\n"
+    "分析领域画像中的时间特征，提取每轮 wave 对应的现实时间窗口。"
+    "{horizon_line}"
+    "重点关注：内容衰减周期、推荐算法刷新周期、传播关键窗口、互动高峰时段。"
+    "如果画像中有明确的时间约定，直接使用；"
+    "如果没有，请基于对该平台特性的理解裁定一个合理值。\n\n"
+    "**第二步：Agent 配置**\n"
+    "根据领域画像和动态参数，创建 Star（KOL）Agent 和 Sea（用户群体）Agent。"
+    "每个 Star 应有明确的 id、描述和影响力等级。"
+    "每个 Sea 应有明确的 id、描述和兴趣标签。\n\n"
+    "**第三步：拓扑结构与种子涟漪**\n"
+    "基于已创建的 Agent，构建它们之间的拓扑连接（edges）和种子涟漪（初始传播信号）。"
+    "种子涟漪代表内容刚发布时的初始信号，其 initial_energy 通常在 0.3-0.8 之间。\n\n"
+    "输出严格 JSON，格式如下：\n"
+    "```json\n"
+)
+
+OMNISCIENT_INIT_MERGED_JSON_EXAMPLE = json.dumps({
+    "dynamic_parameters": {
+        "wave_time_window": "4h",
+        "wave_time_window_reasoning": "从画像中提取的推理依据...",
+        "energy_decay_per_wave": 0.15,
+        "platform_characteristics": "平台关键特征摘要",
+    },
+    "star_configs": [
+        {"id": "star_xxx", "description": "...", "influence_level": "high/medium/low"}
+    ],
+    "sea_configs": [
+        {"id": "sea_xxx", "description": "...", "interest_tags": ["tag1", "tag2"]}
+    ],
+    "topology": {
+        "edges": [
+            {"from": "agent_id_1", "to": "agent_id_2", "weight": 0.7}
+        ]
+    },
+    "seed_ripple": {
+        "content": "种子涟漪内容描述",
+        "initial_energy": 0.6,
+    },
+}, ensure_ascii=False, indent=2)
+
+OMNISCIENT_INIT_MERGED_SYSTEM = None  # Built dynamically in _build_init_merged_prompt
+
+OMNISCIENT_INIT_MERGED_USER = (
+    "## 领域画像\n\n{skill_profile}\n\n"
+    "## 模拟请求\n\n{input_json}\n\n"
 )
 
 # --- RIPPLE:verdict ---
