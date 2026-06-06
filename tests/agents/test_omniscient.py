@@ -7,6 +7,127 @@ from ripple.agents.omniscient import OmniscientAgent
 from ripple.primitives.models import OmniscientVerdict
 
 
+class TestOmniscientInitMerged:
+    @pytest.mark.asyncio
+    async def test_init_merged_produces_all_fields(self, monkeypatch):
+        """合并 INIT 模式应在 1 次 LLM 调用中产生所有必要字段。 / Merged INIT produces all required fields in 1 LLM call."""
+        monkeypatch.setenv("RIPPLE_INIT_MERGED", "true")
+
+        mock_llm_caller = AsyncMock()
+        mock_llm_caller.return_value = json.dumps({
+            "dynamic_parameters": {
+                "wave_time_window": "4h",
+                "wave_time_window_reasoning": "小红书内容在4-6小时内决定命运",
+                "energy_decay_per_wave": 0.15,
+                "platform_characteristics": "内容驱动型平台",
+            },
+            "star_configs": [
+                {"id": "star_kol_1", "description": "美妆头部博主",
+                 "influence_level": "high"},
+            ],
+            "sea_configs": [
+                {"id": "sea_young_women", "description": "18-25岁女性用户群体",
+                 "interest_tags": ["美妆", "护肤"]},
+            ],
+            "topology": {
+                "edges": [
+                    {"from": "star_kol_1", "to": "sea_young_women", "weight": 0.8},
+                ],
+            },
+            "seed_ripple": {
+                "content": "测试内容",
+                "initial_energy": 0.6,
+            },
+        })
+
+        agent = OmniscientAgent(llm_caller=mock_llm_caller)
+        result = await agent.init(
+            skill_profile="这是社交媒体领域的画像描述...",
+            simulation_input={
+                "event": {"description": "一条美妆笔记"},
+                "skill": "social-media",
+                "platform": "xiaohongshu",
+            },
+        )
+
+        assert mock_llm_caller.call_count == 1  # 1 次 merged call
+        assert len(result["star_configs"]) >= 1
+        assert len(result["sea_configs"]) >= 1
+        assert "topology" in result
+        assert "dynamic_parameters" in result
+        assert "seed_ripple" in result
+        assert result["dynamic_parameters"]["wave_time_window"] == "4h"
+
+    @pytest.mark.asyncio
+    async def test_init_merged_retry_on_invalid_json(self, monkeypatch):
+        """合并 INIT 模式在 JSON 解析失败时应重试。 / Merged INIT retries on JSON parse failure."""
+        monkeypatch.setenv("RIPPLE_INIT_MERGED", "true")
+
+        mock_llm_caller = AsyncMock()
+        mock_llm_caller.side_effect = [
+            "这不是JSON",  # 第1次失败
+            json.dumps({    # 第2次成功
+                "dynamic_parameters": {
+                    "wave_time_window": "2h",
+                    "wave_time_window_reasoning": "test",
+                    "energy_decay_per_wave": 0.1,
+                    "platform_characteristics": "test",
+                },
+                "star_configs": [{"id": "star_1", "description": "t",
+                                  "influence_level": "low"}],
+                "sea_configs": [{"id": "sea_1", "description": "t",
+                                 "interest_tags": []}],
+                "topology": {"edges": []},
+                "seed_ripple": {"content": "t", "initial_energy": 0.5},
+            }),
+        ]
+
+        agent = OmniscientAgent(llm_caller=mock_llm_caller)
+        result = await agent.init(
+            skill_profile="test",
+            simulation_input={"event": {"description": "test"}, "skill": "test"},
+        )
+
+        assert mock_llm_caller.call_count == 2  # 1 次重试 + 1 次成功
+        assert len(result["star_configs"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_init_merged_prompt_contains_all_sections(self, monkeypatch):
+        """合并 INIT prompt 应包含时间分析、Agent 创建、拓扑构建三部分指令。 / Merged INIT prompt should contain all 3 sections."""
+        monkeypatch.setenv("RIPPLE_INIT_MERGED", "true")
+
+        sys_calls = []
+        async def tracking_caller(*, system_prompt="", user_prompt=""):
+            sys_calls.append(system_prompt)
+            return json.dumps({
+                "dynamic_parameters": {
+                    "wave_time_window": "4h",
+                    "wave_time_window_reasoning": "test",
+                    "energy_decay_per_wave": 0.15,
+                    "platform_characteristics": "test",
+                },
+                "star_configs": [{"id": "star_1", "description": "t",
+                                  "influence_level": "low"}],
+                "sea_configs": [{"id": "sea_1", "description": "t",
+                                 "interest_tags": []}],
+                "topology": {"edges": []},
+                "seed_ripple": {"content": "t", "initial_energy": 0.5},
+            })
+
+        agent = OmniscientAgent(llm_caller=tracking_caller)
+        await agent.init(
+            skill_profile="test_profile",
+            simulation_input={"event": {"description": "test"}, "skill": "test"},
+        )
+
+        prompt = sys_calls[0]
+        assert "时间" in prompt or "wave_time_window" in prompt
+        assert "star_configs" in prompt
+        assert "topology" in prompt
+        assert "seed_ripple" in prompt
+        assert "dynamic_parameters" in prompt
+
+
 class TestOmniscientInit:
     @pytest.mark.asyncio
     async def test_init_produces_star_and_sea_configs(self):

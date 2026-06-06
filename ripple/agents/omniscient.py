@@ -35,6 +35,9 @@ from ripple.prompts import (
     OMNISCIENT_INIT_AGENTS_USER,
     OMNISCIENT_INIT_TOPOLOGY_SYSTEM,
     OMNISCIENT_INIT_TOPOLOGY_USER,
+    OMNISCIENT_INIT_MERGED_SYSTEM_TEMPLATE,
+    OMNISCIENT_INIT_MERGED_JSON_EXAMPLE,
+    OMNISCIENT_INIT_MERGED_USER,
     OMNISCIENT_RIPPLE_VERDICT_SYSTEM,
     OMNISCIENT_RIPPLE_VERDICT_USER,
     OMNISCIENT_OBSERVE_SYSTEM,
@@ -231,9 +234,11 @@ class OmniscientAgent:
         skill_profile: str,
         simulation_input: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Phase INIT: 初始化模拟场景（3 次聚焦 LLM 调用）。 / Initialize simulation scene (3 focused LLM calls).
+        """Phase INIT: 初始化模拟场景。 / Initialize simulation scene.
 
         Fix #1b: Sets phase timeout budget for cumulative LLM call tracking.
+
+        When RIPPLE_INIT_MERGED=true, uses a single merged LLM call instead of 3 serial sub-calls.
         """
         from ripple.engine.runtime import (
             _resolve_phase_timeout,
@@ -242,6 +247,19 @@ class OmniscientAgent:
 
         if _PHASE_TIMEOUTS_ENABLED:
             self.set_phase_timeout("INIT", _resolve_phase_timeout("INIT"))
+
+        merged = os.environ.get("RIPPLE_INIT_MERGED", "").lower() in ("true", "1", "yes")
+        if merged:
+            return await self._init_merged(skill_profile, simulation_input)
+
+        return await self._init_three_sub_calls(skill_profile, simulation_input)
+
+    async def _init_three_sub_calls(
+        self,
+        skill_profile: str,
+        simulation_input: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Original 3-sub-call INIT mode. / 原始 3 次 sub-call INIT 模式。"""
 
         # Sub-call 1: 场景分析 + 时间参数 / Scene analysis + time params
         dynamic_parameters = await self._init_sub_call(
@@ -408,6 +426,47 @@ class OmniscientAgent:
             raise ValueError("star_configs 不能为空")
         if not result.get("sea_configs"):
             raise ValueError("sea_configs 不能为空")
+
+    async def _init_merged(
+        self,
+        skill_profile: str,
+        simulation_input: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Merged INIT: 1 次 LLM 调用完成 dynamics + agents + topology + seed。 / Merged INIT: complete all in 1 LLM call."""
+        prompts = self._build_init_merged_prompt(skill_profile, simulation_input)
+        result = await self._init_sub_call(
+            prompts,
+            phase="INIT:merged",
+            required_fields=INIT_REQUIRED_FIELDS,
+            error_label="INIT:merged",
+        )
+        self._validate_init_result(result)
+        self._init_result = result
+        return result
+
+    def _build_init_merged_prompt(
+        self,
+        skill_profile: str,
+        simulation_input: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """构建合并 INIT prompt。 / Build merged INIT prompt."""
+        input_json = json.dumps(simulation_input, ensure_ascii=False, indent=2)
+        horizon = simulation_input.get("simulation_horizon", "")
+        horizon_line = (
+            OMNISCIENT_INIT_DYNAMICS_HORIZON_LINE.format(horizon=horizon)
+            if horizon
+            else ""
+        )
+        system = (
+            OMNISCIENT_INIT_MERGED_SYSTEM_TEMPLATE.format(horizon_line=horizon_line)
+            + OMNISCIENT_INIT_MERGED_JSON_EXAMPLE
+            + "\n```\n"
+        )
+        user = OMNISCIENT_INIT_MERGED_USER.format(
+            skill_profile=skill_profile,
+            input_json=input_json,
+        )
+        return system, user
 
     # =========================================================================
     # Phase RIPPLE
