@@ -312,7 +312,7 @@ class LLMConfigLoader:
         """加载配置文件（YAML）。 / Load config file (YAML)."""
         if config_file:
             path = Path(config_file)
-            if path.exists():
+            if path.is_file():
                 self._file_config = self._read_yaml(path)
                 logger.info("LLM 配置文件已加载: %s", path)
                 return

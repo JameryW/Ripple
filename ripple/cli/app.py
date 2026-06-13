@@ -3749,6 +3749,60 @@ def doctor(
             "status": "idle" if running_job_id is None else "running",
             "running_job_id": running_job_id,
         }
+
+        # Prediction quality subsystem health check
+        quality_checks: Dict[str, Any] = {}
+        try:
+            from ripple.primitives.prediction_quality import (
+                ConfidenceGate, ConfidenceLevel, normalize_confidence,
+                parse_prediction_contract, PredictionContract,
+            )
+            from ripple.providers.historical_calibrator import HistoricalCalibrator
+            from ripple.engine.quality_report import build_quality_report
+            from ripple.backtest.schema import SCHEMA_VERSION
+
+            # Test confidence gate
+            gate = ConfidenceGate()
+            gate_result = gate.evaluate("high", provider_available=True)
+            quality_checks["confidence_gate"] = {
+                "ok": gate_result.final_confidence == ConfidenceLevel.HIGH,
+                "factors": len(gate_result.factors),
+            }
+
+            # Test prediction contract parser
+            contract = parse_prediction_contract(
+                {"impressions": 50000, "confidence": "medium"},
+                skill_id="health-check",
+            )
+            quality_checks["prediction_contract"] = {
+                "ok": isinstance(contract, PredictionContract) and len(contract.predictions) == 1,
+                "schema_version": SCHEMA_VERSION,
+            }
+
+            # Test historical calibrator
+            calibrator = HistoricalCalibrator()
+            report = calibrator.calibrate({"views": 1000}, [{"views": 500, "views": 1500}])
+            quality_checks["historical_calibrator"] = {
+                "ok": report is not None,
+            }
+
+            # Test quality report builder
+            qr = build_quality_report(
+                simulation_input={"event": {"title": "test"}},
+                result={"prediction": {"confidence": "medium"}},
+            )
+            quality_checks["quality_report"] = {
+                "ok": qr.input_completeness >= 0.0,
+                "dimensions": len(qr.to_dict()),
+            }
+
+        except Exception as exc:
+            quality_checks["error"] = str(exc)
+
+        quality_ok = all(bool(v.get("ok", False)) for v in quality_checks.values() if isinstance(v, dict))
+        quality_checks["ok"] = quality_ok
+        checks["prediction_quality"] = quality_checks
+
         payload = {"checks": checks}
         overall_ok = all(bool(item.get("ok")) for item in checks.values())
         payload["ok"] = overall_ok
