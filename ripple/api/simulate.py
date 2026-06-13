@@ -480,6 +480,20 @@ async def simulate(
                 "dissent_points": list(getattr(last, "dissent_points", [])) if last else [],
             }
 
+            # R6: Extract structured audit fields from final round
+            if last is not None:
+                audit_fields = {
+                    "key_evidence": list(getattr(last, "key_evidence", [])),
+                    "uncertainties": list(getattr(last, "uncertainties", [])),
+                    "optimism_audit": list(getattr(last, "optimism_audit", [])),
+                    "overrated_dimensions": list(getattr(last, "overrated_dimensions", [])),
+                    "missing_evidence": list(getattr(last, "missing_evidence", [])),
+                    "recommended_confidence_cap": getattr(last, "recommended_confidence_cap", None),
+                }
+                # Only include if any audit field is non-empty
+                if any(v for k, v in audit_fields.items() if k != "recommended_confidence_cap") or audit_fields["recommended_confidence_cap"]:
+                    deliberation_summary["audit"] = audit_fields
+
             return {
                 "deliberation_records": records_dict,
                 "deliberation_summary": deliberation_summary,
@@ -728,6 +742,67 @@ async def _run_ensemble(
 
         return cleaned or None
 
+    def _aggregate_numeric_predictions(
+        results: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """R5: Aggregate numeric prediction fields across ensemble runs.
+
+        For each numeric field found in prediction dicts, compute
+        median, min, max, range, stability, and per-run values.
+        Also identifies divergence reasons for fields with low stability.
+        Returns empty dict if no numeric fields or only 1 run.
+        """
+        if len(results) < 2:
+            return {}
+
+        _SKIP = {"step", "tick", "t", "phase", "agent_id", "id", "timestamp",
+                 "confidence", "confidence_gate_reason"}
+        # Collect numeric fields from all runs' prediction dicts
+        field_values: Dict[str, List[float]] = {}
+        for res in results:
+            pred = res.get("prediction", {})
+            if not isinstance(pred, dict):
+                continue
+            for key, val in pred.items():
+                if key.lower() in _SKIP:
+                    continue
+                if isinstance(val, (int, float)):
+                    field_values.setdefault(key, []).append(float(val))
+
+        distributions: Dict[str, Dict[str, Any]] = {}
+        divergence_reasons: List[str] = []
+        for field, values in field_values.items():
+            if len(values) < 2:
+                continue
+            sorted_v = sorted(values)
+            n = len(sorted_v)
+            median = sorted_v[n // 2] if n % 2 == 1 else (sorted_v[n // 2 - 1] + sorted_v[n // 2]) / 2
+            disp_range = sorted_v[-1] - sorted_v[0]
+            # When median is zero or near-zero, use absolute range for stability
+            ref = abs(median) if abs(median) > 0.001 else max(abs(sorted_v[-1]), abs(sorted_v[0]), 0.001)
+            stability = "high" if disp_range <= ref * 0.2 else ("medium" if disp_range <= ref * 0.5 else "low")
+            distributions[field] = {
+                "median": round(median, 2),
+                "min": round(sorted_v[0], 2),
+                "max": round(sorted_v[-1], 2),
+                "range": round(disp_range, 2),
+                "stability": stability,
+                "values": [round(v, 2) for v in values],
+            }
+            if stability == "low":
+                divergence_reasons.append(
+                    f"{field}: range {round(disp_range, 2)} exceeds 50% of median {round(median, 2)}"
+                )
+            elif stability == "medium":
+                divergence_reasons.append(
+                    f"{field}: range {round(disp_range, 2)} exceeds 20% of median {round(median, 2)}"
+                )
+
+        if divergence_reasons:
+            distributions["_divergence_reasons"] = divergence_reasons
+
+        return distributions
+
     all_results: List[Dict[str, Any]] = []
     failed = 0
 
@@ -836,6 +911,11 @@ async def _run_ensemble(
         "dimension_agreement_level": dimension_kappa_level,
         "kappa_dimensions": kappa_dimensions,
     }
+
+    # R5: Numeric prediction distributions across ensemble runs
+    numeric_distributions = _aggregate_numeric_predictions(all_results)
+    if numeric_distributions:
+        ensemble_stats["numeric_distributions"] = numeric_distributions
 
     merged = dict(last)
     merged["ensemble_runs_completed"] = completed

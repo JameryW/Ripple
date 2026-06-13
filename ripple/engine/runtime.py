@@ -227,6 +227,9 @@ class SimulationRuntime:
         self._seed_energy: float = 0.0
         self._validation_reports: Dict[str, Any] = {}
         self._historical_records_injected: int = 0
+        self._evidence_pack_v2: Any = None  # R2: upgraded evidence pack dataclass
+        self._run_id: Optional[str] = None  # stored for evidence pack ids
+        self._calibration_report: Any = None  # R4: calibration report with actions
 
         # 构建阶段序列（支持 Skill 注册额外阶段）/ Build phase sequence (supports Skill extra phases)
         self._phases = self._build_phase_sequence(extra_phases)
@@ -505,6 +508,7 @@ class SimulationRuntime:
             run_id: 可选的外部指定 run_id。若不传则自动生成。 / Optional external run_id; auto-generated if omitted.
         """
         run_id = run_id or str(uuid.uuid4())[:8]
+        self._run_id = run_id
         logger.info(f"[{run_id}] 开始模拟")
 
         # Job-level timeout: wrap entire simulation in asyncio.wait_for
@@ -1161,20 +1165,148 @@ class SimulationRuntime:
         # HistoricalProvider 后置校验 / Post-hoc historical validation
         await self._validate_historical(result, simulation_input, run_id)
 
+        # R4: Historical calibration with percentile baselines and actions
+        calibration_report = self._calibrate_historical(result, simulation_input)
+
         # Build provider_insights from validation reports + provider state
         insights = self._build_provider_insights(simulation_input)
+
+        # R4: Add calibration actions to provider_insights
+        if calibration_report is not None and calibration_report.has_actions:
+            insights.setdefault("historical", {})["calibration"] = {
+                "bucket_key": calibration_report.bucket_key,
+                "actions": [
+                    {
+                        "action_type": a.action_type,
+                        "metric": a.metric,
+                        "reason": a.reason,
+                        "original_value": a.original_value,
+                        "calibrated_value": a.calibrated_value,
+                        "deviation_pct": a.deviation_pct,
+                        "confidence_cap": a.confidence_cap,
+                    }
+                    for a in calibration_report.actions
+                ],
+            }
+
         # Always set provider_insights when providers are configured (even if empty dict);
         # omit the key entirely when no providers were configured (backward compat)
         if self._providers is not None:
             result["provider_insights"] = insights
+
+        # R3/R4/R5/R6: Confidence Gate — evaluate multi-factor confidence
+        gate_result = self._evaluate_confidence_gate(result, insights)
+        result["confidence_gate"] = {
+            "original_confidence": gate_result.original_confidence.value,
+            "final_confidence": gate_result.final_confidence.value,
+            "gate_applied": gate_result.gate_applied,
+            "reason": gate_result.reason,
+            "factors": [
+                {
+                    "name": f.name,
+                    "level": f.level.value,
+                    "reason": f.reason,
+                    "passed": f.passed,
+                }
+                for f in gate_result.factors
+            ],
+        }
+        # Apply gated confidence to prediction if gate fired
+        if gate_result.gate_applied:
+            pred = result.get("prediction")
+            if isinstance(pred, dict):
+                pred["confidence"] = gate_result.final_confidence.value
+                pred["confidence_gate_reason"] = gate_result.reason
+            result["confidence"] = gate_result.final_confidence.value
+
+        # R3: Mark as relative simulation when no real providers are available
+        provider_factor = next((f for f in gate_result.factors if f.name == "provider_availability"), None)
+        if provider_factor and not provider_factor.passed:
+            result["simulation_mode"] = "relative"
+
+        # R1: Parse prediction into structured contract
+        try:
+            from ripple.primitives.prediction_quality import parse_prediction_contract
+            contract = parse_prediction_contract(
+                result.get("prediction", {}),
+                skill_id=getattr(self, "_skill_id", "") or "",
+                evidence_pack_v2=self._evidence_pack_v2,
+            )
+            result["prediction_contract"] = contract.to_dict()
+        except Exception as exc:
+            logger.warning("Prediction contract parsing failed (non-fatal): %s", exc)
+
+        # R8: Generate prediction quality report
+        from ripple.engine.quality_report import build_quality_report
+        # Extract deliberation_summary from extra phase outputs for tribunal divergence
+        _delib_output = self._extra_phase_outputs.get("DELIBERATE", {})
+        _delib_summary = _delib_output.get("deliberation_summary") if isinstance(_delib_output, dict) else None
+        quality_report = build_quality_report(
+            simulation_input=simulation_input,
+            result=result,
+            providers=self._providers,
+            evidence_pack_v2=self._evidence_pack_v2,
+            calibration_report=self._calibration_report,
+            deliberation_summary=_delib_summary,
+        )
+        result["quality_report"] = quality_report.to_dict()
 
         # 增量记录：SYNTHESIZE 阶段结果（合成数据写入顶层键以保持向后兼容） / Incremental record: SYNTHESIZE result (top-level keys for backward compat)
         if self._recorder:
             self._recorder.record_synthesis(result)
             if insights:
                 self._recorder.record_process("providers", insights)
+            self._recorder.record_process("quality_report", quality_report.to_dict())
 
         logger.info(f"[{run_id}] 模拟完成: {effective_waves} waves, LLM 调用链结束")
+        # Build quality detail for SSE event
+        quality_detail: Dict[str, Any] = {
+            "total_waves": effective_waves,
+            "prediction_verdict": self._short_text(
+                (
+                    result.get("prediction", {}).get("verdict")
+                    if isinstance(result.get("prediction"), dict)
+                    else result.get("prediction")
+                )
+                or result.get("prediction_verdict")
+                or "",
+                limit=160,
+            ),
+        }
+        # R8: quality fields in SSE
+        if "confidence_gate" in result:
+            cg = result["confidence_gate"]
+            quality_detail["confidence_gate_result"] = {
+                "original_confidence": cg.get("original_confidence"),
+                "final_confidence": cg.get("final_confidence"),
+                "gate_applied": cg.get("gate_applied"),
+                "reason": cg.get("reason"),
+            }
+        if self._evidence_pack_v2 is not None:
+            ep = self._evidence_pack_v2
+            quality_detail["evidence_balance"] = {
+                "positive": ep.positive_signals.count,
+                "negative": ep.negative_signals.count,
+                "silent": ep.silent_signals.count,
+                "cross_layer_depth": ep.cross_layer_depth,
+            }
+        # Provider status summary
+        provider_status: Dict[str, str] = {}
+        if self._providers is not None:
+            from ripple.providers.registry import ProviderRegistry
+            if isinstance(self._providers, ProviderRegistry):
+                for cat in ("historical", "topology", "embedding", "ambient"):
+                    try:
+                        p = self._providers.get(cat)
+                        provider_status[cat] = "available" if p.is_available() else "stub"
+                    except Exception:
+                        provider_status[cat] = "error"
+        if provider_status:
+            quality_detail["provider_status"] = provider_status
+
+        # R8: Full quality report in SSE event
+        quality_detail["quality_report"] = result.get("quality_report", {})
+
         await self._emit(
             SimulationEvent(
                 type="phase_end",
@@ -1182,19 +1314,7 @@ class SimulationRuntime:
                 run_id=run_id,
                 progress=1.0,
                 total_waves=estimated_waves,
-                detail={
-                    "total_waves": effective_waves,
-                    "prediction_verdict": self._short_text(
-                        (
-                            result.get("prediction", {}).get("verdict")
-                            if isinstance(result.get("prediction"), dict)
-                            else result.get("prediction")
-                        )
-                        or result.get("prediction_verdict")
-                        or "",
-                        limit=160,
-                    ),
-                },
+                detail=quality_detail,
             )
         )
         return result
@@ -1305,6 +1425,42 @@ class SimulationRuntime:
         except Exception as exc:
             logger.warning("Historical validation failed (non-fatal): %s", exc)
 
+    def _calibrate_historical(
+        self,
+        synthesize_result: Dict[str, Any],
+        simulation_input: Dict[str, Any],
+    ) -> Any:
+        """R4: Calibrate prediction against historical data with percentile baselines.
+
+        Returns a CalibrationReport with structured actions, or None on failure.
+        """
+        historical = simulation_input.get("historical")
+        if not historical or not isinstance(historical, list):
+            return None
+
+        try:
+            from ripple.providers.historical_calibrator import HistoricalCalibrator
+            calibrator = HistoricalCalibrator()
+
+            # Build bucket context from simulation input
+            bucket_context = {}
+            for key in ("platform", "channel", "vertical"):
+                val = simulation_input.get(key)
+                if val:
+                    bucket_context[key] = val
+
+            report = calibrator.calibrate(
+                synthesize_result.get("prediction", {}),
+                historical,
+                bucket_context=bucket_context or None,
+            )
+            report.log()
+            self._calibration_report = report
+            return report
+        except Exception as exc:
+            logger.warning("Historical calibration failed (non-fatal): %s", exc)
+            return None
+
     # ------------------------------------------------------------------
     # Provider Insights — build summary of provider usage for output
     # ------------------------------------------------------------------
@@ -1358,6 +1514,111 @@ class SimulationRuntime:
             insights[cat] = entry
 
         return insights
+
+    def _evaluate_confidence_gate(
+        self,
+        result: Dict[str, Any],
+        provider_insights: Dict[str, Any],
+    ) -> Any:
+        """R3/R4/R5/R6: Evaluate multi-factor confidence gate on SYNTHESIZE output.
+
+        Factors:
+        1. Provider availability — missing → cap to medium
+        2. Ensemble stability — low kappa/stability → lower confidence
+        3. Historical deviation — exceeded threshold → lower confidence
+        4. Evidence balance — positive/negative imbalance → lower confidence
+        5. Tribunal audit — recommended confidence cap from DELIBERATE phase
+        6. Topology calibration — scale/type deviation from provider data
+        """
+        from ripple.primitives.prediction_quality import ConfidenceGate, ConfidenceLevel
+
+        gate = ConfidenceGate()
+
+        # Extract raw confidence from result
+        pred = result.get("prediction", {})
+        if isinstance(pred, dict):
+            raw_confidence = pred.get("confidence", "medium")
+        else:
+            raw_confidence = result.get("confidence", "medium")
+
+        # Factor 1: Provider availability
+        provider_available = False
+        if self._providers is not None:
+            from ripple.providers.registry import ProviderRegistry
+            if isinstance(self._providers, ProviderRegistry):
+                for cat in ("historical", "topology", "embedding", "ambient"):
+                    try:
+                        p = self._providers.get(cat)
+                        if p.is_available():
+                            provider_available = True
+                            break
+                    except Exception:
+                        pass
+
+        # Factor 2: Ensemble stability
+        ensemble_stats = result.get("ensemble_stats", {})
+        ensemble_kappa = ensemble_stats.get("dimension_agreement_kappa") if isinstance(ensemble_stats, dict) else None
+        ensemble_stability = None
+        # Derive from dimension aggregates stability_level if present
+        dim_agg = ensemble_stats.get("dimension_aggregates", {}) if isinstance(ensemble_stats, dict) else {}
+        if isinstance(dim_agg, dict):
+            stability_levels = set()
+            for dim_vals in dim_agg.values():
+                if isinstance(dim_vals, dict):
+                    sl = dim_vals.get("stability_level")
+                    if sl:
+                        stability_levels.add(sl)
+            if stability_levels:
+                ensemble_stability = min(stability_levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))
+        agreement_rate = ensemble_stats.get("grade_agreement_rate") if isinstance(ensemble_stats, dict) else None
+
+        # Factor 3: Historical deviation
+        hist_max_dev = None
+        hist_insights = provider_insights.get("historical", {})
+        if isinstance(hist_insights, dict):
+            hist_validation = hist_insights.get("validation", {})
+            if isinstance(hist_validation, dict):
+                hist_max_dev = hist_validation.get("max_deviation_pct")
+
+        # Factor 4: Evidence balance
+        pos_count = 0
+        neg_count = 0
+        silent_count = 0
+        if self._evidence_pack_v2 is not None:
+            pos_count = self._evidence_pack_v2.positive_signals.count
+            neg_count = self._evidence_pack_v2.negative_signals.count
+            silent_count = self._evidence_pack_v2.silent_signals.count
+
+        # R6: Tribunal recommended confidence cap
+        tribunal_cap = None
+        deliberate_output = self._extra_phase_outputs.get("DELIBERATE", {})
+        if isinstance(deliberate_output, dict):
+            audit = (deliberate_output.get("deliberation_summary") or {}).get("audit")
+            if isinstance(audit, dict):
+                tribunal_cap = audit.get("recommended_confidence_cap")
+
+        # R3: Topology calibration from validation report
+        topo_scale_ok = None
+        topo_type_ok = None
+        topo_report = self._validation_reports.get("topology")
+        if topo_report is not None:
+            topo_scale_ok = getattr(getattr(topo_report, "scale", None), "is_acceptable", None)
+            topo_type_ok = getattr(getattr(topo_report, "type_dist", None), "is_acceptable", None)
+
+        return gate.evaluate(
+            raw_confidence,
+            provider_available=provider_available,
+            ensemble_kappa=ensemble_kappa,
+            ensemble_stability=ensemble_stability,
+            ensemble_agreement_rate=agreement_rate,
+            historical_max_deviation_pct=hist_max_dev,
+            evidence_positive_count=pos_count,
+            evidence_negative_count=neg_count,
+            evidence_silent_count=silent_count,
+            tribunal_confidence_cap=tribunal_cap,
+            topology_scale_acceptable=topo_scale_ok,
+            topology_type_acceptable=topo_type_ok,
+        )
 
     def _serialize_validation(self, report: Any) -> Dict[str, Any]:
         """Serialize a validation report into the provider_insights schema.
@@ -1660,19 +1921,49 @@ class SimulationRuntime:
         return stats
 
     def _build_evidence_pack(self) -> Dict[str, Any]:
-        """Build a compressed evidence pack from wave records (PMF v3+).
+        """Build a compressed evidence pack from wave records (PMF v3+ / R2).
 
         Keeps structure stable and bounded:
         - summary: <= 500 chars
-        - key_signals: <= 10 items
+        - key_signals: <= 10 items (with evidence_id)
+        - positive_signals / negative_signals / silent_signals: classified by type
+        - stratified: Star/Sea counts and energy
+        - response_type_distribution: full distribution
+        - energy_decay: per-wave energy totals
+        - cross_layer_depth: max propagation depth
+        - pack_id: unique id for cross-referencing
         - full_records_ref: JSON Pointer to raw wave records in recorder output
         """
+        from ripple.primitives.prediction_quality import (
+            EvidencePackV2,
+            SignalSummary,
+            StratifiedStats,
+            EnergyDecaySummary,
+        )
+
         total_waves = len(self._wave_records)
         response_type_counts: Dict[str, int] = {}
-        signals: List[Dict[str, Any]] = []
+        positive_signals: List[Dict[str, Any]] = []
+        negative_signals: List[Dict[str, Any]] = []
+        silent_signals: List[Dict[str, Any]] = []
+        all_signals: List[Dict[str, Any]] = []
+        wave_energies: List[float] = []
+        cross_layer_depth = 0
+        star_energy_total = 0.0
+        sea_energy_total = 0.0
+        star_response_types: Dict[str, int] = {}
+        sea_response_types: Dict[str, int] = {}
+        star_count = len(self._stars)
+        sea_count = len(self._seas)
+        pack_counter = 0
+
+        _POSITIVE_TYPES = {"amplify", "create", "adopt", "recommend"}
+        _NEGATIVE_TYPES = {"reject", "suppress", "complaint", "skepticism"}
+        _SILENT_TYPES = {"ignore", "no-action", "low-energy"}
 
         for record in self._wave_records:
             wave_id = f"w{record.wave_number}"
+            wave_total_energy = 0.0
             for aid, resp in (record.agent_responses or {}).items():
                 rtype = str(resp.get("response_type", "unknown"))
                 response_type_counts[rtype] = response_type_counts.get(rtype, 0) + 1
@@ -1680,9 +1971,19 @@ class SimulationRuntime:
                     energy = float(resp.get("outgoing_energy", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     energy = 0.0
+                wave_total_energy += energy
 
-                if rtype == "ignore" and energy <= 0:
-                    continue
+                is_star = aid in self._stars
+                if is_star:
+                    star_energy_total += energy
+                    star_response_types[rtype] = star_response_types.get(rtype, 0) + 1
+                else:
+                    sea_energy_total += energy
+                    sea_response_types[rtype] = sea_response_types.get(rtype, 0) + 1
+
+                trace_len = int(resp.get("trace_len", 0) or 0)
+                if trace_len > cross_layer_depth:
+                    cross_layer_depth = trace_len
 
                 signal_text = (
                     resp.get("cluster_reaction")
@@ -1690,43 +1991,143 @@ class SimulationRuntime:
                     or resp.get("reasoning")
                     or ""
                 )
-                signals.append(
-                    {
-                        "wave_id": wave_id,
-                        "agent_id": aid,
-                        "response_type": rtype,
-                        "outgoing_energy": round(energy, 4),
-                        "signal": str(signal_text)[:160],
-                    }
-                )
+                pack_counter += 1
+                eid = f"ev-{pack_counter}"
+                signal_entry = {
+                    "evidence_id": eid,
+                    "wave_id": wave_id,
+                    "agent_id": aid,
+                    "agent_type": "star" if is_star else "sea",
+                    "response_type": rtype,
+                    "outgoing_energy": round(energy, 4),
+                    "signal": str(signal_text)[:160],
+                }
+                all_signals.append(signal_entry)
+
+                if rtype in _POSITIVE_TYPES:
+                    positive_signals.append(signal_entry)
+                elif rtype in _NEGATIVE_TYPES:
+                    negative_signals.append(signal_entry)
+                elif rtype in _SILENT_TYPES:
+                    silent_signals.append(signal_entry)
+
+            wave_energies.append(round(wave_total_energy, 4))
 
         # Top signals by outgoing energy, cap at 10
-        signals.sort(key=lambda x: float(x.get("outgoing_energy", 0.0)), reverse=True)
-        key_signals = signals[:10]
+        all_signals.sort(key=lambda x: float(x.get("outgoing_energy", 0.0)), reverse=True)
+        key_signals = all_signals[:10]
 
         stats = {
             "total_waves": total_waves,
             "response_type_counts": response_type_counts,
-            "stars_count": len(self._stars),
-            "seas_count": len(self._seas),
+            "stars_count": star_count,
+            "seas_count": sea_count,
         }
 
-        summary = (
-            f"{total_waves} waves completed. "
-            f"Responses: {response_type_counts}. "
-            f"Agents: Star×{len(self._stars)}, Sea×{len(self._seas)}."
+        # Build classified summaries (top 5 each)
+        positive_signals.sort(key=lambda x: float(x.get("outgoing_energy", 0.0)), reverse=True)
+        negative_signals.sort(key=lambda x: float(x.get("outgoing_energy", 0.0)), reverse=True)
+
+        pos_summary = SignalSummary(
+            count=len(positive_signals),
+            top_signals=positive_signals[:5],
+            energy_total=round(sum(s.get("outgoing_energy", 0.0) for s in positive_signals), 4),
         )
+        neg_summary = SignalSummary(
+            count=len(negative_signals),
+            top_signals=negative_signals[:5],
+            energy_total=round(sum(s.get("outgoing_energy", 0.0) for s in negative_signals), 4),
+        )
+        silent_summary = SignalSummary(
+            count=len(silent_signals),
+            top_signals=silent_signals[:5],
+            energy_total=0.0,
+        )
+
+        stratified = StratifiedStats(
+            star_count=star_count,
+            sea_count=sea_count,
+            star_energy_total=round(star_energy_total, 4),
+            sea_energy_total=round(sea_energy_total, 4),
+            star_response_types=star_response_types,
+            sea_response_types=sea_response_types,
+        )
+
+        peak_wave = 0
+        decay_rate = 0.0
+        if wave_energies:
+            peak_wave = int(max(range(len(wave_energies)), key=lambda i: wave_energies[i]))
+            if len(wave_energies) >= 2 and wave_energies[0] > 0:
+                nonzero = [e for e in wave_energies if e > 0]
+                if len(nonzero) >= 2:
+                    decay_rate = round(nonzero[-1] / nonzero[0], 4)
+
+        energy_decay = EnergyDecaySummary(
+            wave_energies=wave_energies,
+            peak_wave=peak_wave,
+            decay_rate=decay_rate,
+        )
+
+        pack_id = f"ep-{self._run_id or 'x'}"
+
         source = (
             f"RIPPLE Phase, Wave 0-{max(0, total_waves - 1)}"
             if total_waves > 0
             else "RIPPLE Phase, Wave 0-0"
         )
+        summary = (
+            f"{total_waves} waves. +{pos_summary.count} positive, "
+            f"-{neg_summary.count} negative, ~{silent_summary.count} silent. "
+            f"Star×{star_count}, Sea×{sea_count}. "
+            f"Peak wave {peak_wave}."
+        )
+
+        # Build V2 pack as dataclass then convert to dict for result
+        v2 = EvidencePackV2(
+            pack_id=pack_id,
+            source=source,
+            summary=summary[:500],
+            positive_signals=pos_summary,
+            negative_signals=neg_summary,
+            silent_signals=silent_summary,
+            stratified=stratified,
+            response_type_distribution=response_type_counts,
+            energy_decay=energy_decay,
+            cross_layer_depth=cross_layer_depth,
+            statistics=stats,
+            full_records_ref=self._json_pointer_for_process_key("waves"),
+            key_signals=key_signals,
+        )
+
+        # Store V2 pack for confidence gate consumption
+        self._evidence_pack_v2 = v2
+
         return {
-            "source": source,
-            "summary": summary[:500],
-            "key_signals": key_signals,
-            "statistics": stats,
-            "full_records_ref": self._json_pointer_for_process_key("waves"),
+            "pack_id": v2.pack_id,
+            "source": v2.source,
+            "summary": v2.summary,
+            "key_signals": v2.key_signals,
+            "statistics": v2.statistics,
+            "full_records_ref": v2.full_records_ref,
+            # V2 additions
+            "positive_signals": {"count": v2.positive_signals.count, "top_signals": v2.positive_signals.top_signals, "energy_total": v2.positive_signals.energy_total},
+            "negative_signals": {"count": v2.negative_signals.count, "top_signals": v2.negative_signals.top_signals, "energy_total": v2.negative_signals.energy_total},
+            "silent_signals": {"count": v2.silent_signals.count, "top_signals": v2.silent_signals.top_signals},
+            "stratified": {
+                "star_count": v2.stratified.star_count,
+                "sea_count": v2.stratified.sea_count,
+                "star_energy_total": v2.stratified.star_energy_total,
+                "sea_energy_total": v2.stratified.sea_energy_total,
+                "star_response_types": v2.stratified.star_response_types,
+                "sea_response_types": v2.stratified.sea_response_types,
+            },
+            "response_type_distribution": v2.response_type_distribution,
+            "energy_decay": {
+                "wave_energies": v2.energy_decay.wave_energies,
+                "peak_wave": v2.energy_decay.peak_wave,
+                "decay_rate": v2.energy_decay.decay_rate,
+            },
+            "cross_layer_depth": v2.cross_layer_depth,
         }
 
     def _build_history_with_window(

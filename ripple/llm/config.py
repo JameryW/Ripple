@@ -331,7 +331,7 @@ class LLMConfigLoader:
             return
 
         resolved_path = Path(resolve_llm_config_path(None))
-        if resolved_path.exists():
+        if resolved_path.is_file():
             self._file_config = self._read_yaml(resolved_path)
             logger.info("自动发现 LLM 配置文件: %s", resolved_path)
             return
