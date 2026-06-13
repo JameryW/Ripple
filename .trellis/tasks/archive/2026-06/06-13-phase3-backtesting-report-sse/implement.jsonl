@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Quality report needs provider coverage data from provider_insights contract"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Quality report aggregates data from runtime→recorder→API→SSE; backtest spans CLI→runtime→recorder"}
+{"file": ".trellis/tasks/06-13-prediction-quality-accuracy/prd.md", "reason": "Phase 3 scope: R7 offline backtesting with versioned case schema, R8 quality report, SSE integration"}
