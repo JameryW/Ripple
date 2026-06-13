@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "R3/R4 calibration builds on ProviderRegistry, HistoricalValidator, TopologyValidator, and provider_insights contracts defined here"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Calibration actions and confidence gates must follow project error handling conventions — non-fatal, logged, graceful fallback"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "R1-R8 span runtime→agents→providers→recorder→API; cross-layer data flow guide ensures consistent field propagation"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "PRD emphasizes reusing existing ProviderRegistry, SimulationRecorder, DeliberationOrchestrator, ensemble — reuse guide prevents unnecessary duplication"}
+{"file": ".trellis/tasks/06-13-prediction-quality-accuracy/prd.md", "reason": "Primary requirements document — R1-R8, acceptance criteria, phase boundaries, and out-of-scope constraints"}

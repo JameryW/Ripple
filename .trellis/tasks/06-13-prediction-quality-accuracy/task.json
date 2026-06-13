@@ -1,0 +1,30 @@
+{
+  "id": "prediction-quality-accuracy",
+  "name": "prediction-quality-accuracy",
+  "title": "提升预测分析质量与准确度",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "JameryW",
+  "assignee": "JameryW",
+  "createdAt": "2026-06-13",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "feat/sse-wave-progress-and-api-runtime-fields",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-13-phase1-contract-evidence-gate",
+    "06-13-phase2-calibration-ensemble-tribunal",
+    "06-13-phase3-backtesting-report-sse"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
