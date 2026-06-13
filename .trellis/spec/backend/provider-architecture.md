@@ -586,6 +586,184 @@ _providers:
 
 ---
 
+## HistoricalCalibrator (R4)
+
+> Extends HistoricalValidator from log-only to action-producing calibrator.
+
+### Signatures
+
+```python
+class HistoricalCalibrator:
+    def __init__(
+        self,
+        threshold: float = 100.0,       # deviation % triggers lower_confidence
+        p95_hard_cap: float = 200.0,     # deviation % above P95 → confidence cap "low"
+        bucket_fields: List[str] | None = None,  # default: ["platform", "channel", "vertical"]
+    ): ...
+    def calibrate(
+        self,
+        prediction: Dict[str, Any],
+        historical: List[Dict[str, Any]],
+        bucket_context: Dict[str, Any] | None = None,  # e.g. {"platform": "xiaohongshu"}
+    ) -> CalibrationReport: ...
+```
+
+### CalibrationAction Types
+
+| action_type | Trigger | Effect |
+|-------------|---------|--------|
+| `lower_confidence` | Deviation > threshold or > p95_hard_cap | `confidence_cap` set to "medium" or "low" |
+| `calibrated_prediction` | Predicted > P95 | `calibrated_value` = P95 value |
+| `flag_for_review` | Predicted > 2×P95 | Flagged for human review |
+
+### CalibrationReport Contract
+
+```json
+{
+  "calibrated_metrics": [{"metric": "impressions", "predicted": 5000, "baseline": {...}, "deviation_from_avg_pct": 354.5, "actions": [...]}],
+  "actions": [{"action_type": "lower_confidence", "metric": "impressions", "reason": "...", "confidence_cap": "low"}],
+  "bucket_key": "platform=xiaohongshu,channel=generic",
+  "warnings": []
+}
+```
+
+### Integration Point
+
+`SimulationRuntime._calibrate_historical()` called after `_validate_historical()` in `_finalize_synthesize`:
+- Calibration actions injected into `provider_insights["historical"]["calibration"]`
+- `CalibrationReport` stored on `self._calibration_report` for quality report consumption
+
+### PercentileBaseline
+
+```python
+@dataclass(frozen=True)
+class PercentileBaseline:
+    metric: str
+    count: int
+    avg: float
+    median: float   # P50
+    p75: float
+    p90: float
+    p95: float
+    max_val: float
+```
+
+### Key Rules
+
+| Rule | Behavior |
+|------|----------|
+| No historical data | Returns `CalibrationReport(warnings=["No historical data"])` with no actions |
+| Bucket has fewer records than total | Uses matching bucket records; logs bucket usage |
+| `bucket_context` is None | Uses all records (bucket_key = "default") |
+| Prediction has no numeric fields | Empty `calibrated_metrics`, no actions |
+| Calibrator exception | Returns None (non-fatal), logged by caller |
+
+### Gotcha: _extract_numeric_fields is duplicated
+
+`historical_validator.py` and `historical_calibrator.py` both define `_extract_numeric_fields` with identical logic. This is intentional (each module is independently importable) but must be kept in sync if the skip-list changes.
+
+---
+
+## ConfidenceGate (R3/R4/R5/R6)
+
+> Multi-factor confidence gate that caps prediction confidence based on quality signals.
+
+### Signatures
+
+```python
+class ConfidenceGate:
+    def evaluate(
+        self,
+        raw_confidence: Any,  # str, float, or ConfidenceLevel
+        *,
+        provider_available: bool = True,
+        ensemble_kappa: float | None = None,
+        ensemble_stability: str | None = None,       # "high"|"medium"|"low"
+        ensemble_agreement_rate: float | None = None,
+        historical_max_deviation_pct: float | None = None,
+        historical_threshold_pct: float = 100.0,
+        evidence_positive_count: int = 0,
+        evidence_negative_count: int = 0,
+        evidence_silent_count: int = 0,
+        tribunal_confidence_cap: str | None = None,   # "medium"|"low"
+        topology_scale_acceptable: bool | None = None,
+        topology_type_acceptable: bool | None = None,
+    ) -> ConfidenceGateResult: ...
+```
+
+### Factor Definitions (6 factors)
+
+| # | Factor | Gate Level | Trigger |
+|---|--------|-----------|---------|
+| 1 | `provider_availability` | MEDIUM | No provider `is_available()` |
+| 2 | `ensemble_stability` | LOW/MEDIUM | kappa < 0.4, stability="low", agreement < 0.5 |
+| 3 | `historical_deviation` | MEDIUM/LOW | deviation > threshold (2× → LOW) |
+| 4 | `evidence_balance` | MEDIUM | positive > 90% of non-silent with < 2 negative; silent > 70% |
+| 5 | `tribunal_audit` | per cap | Tribunal `recommended_confidence_cap` |
+| 6 | `topology_calibration` | MEDIUM/LOW | Scale or type distribution exceeds provider bounds (both → LOW) |
+
+### Gate Logic
+
+`final_confidence = min(original, factor1_level, factor2_level, ..., factor6_level)`
+
+If any factor produces a level lower than original, `gate_applied = True` and `reason` lists all triggered factors.
+
+### Integration in runtime.py
+
+`_evaluate_confidence_gate()` extracts all factor inputs from:
+- `self._providers` → provider_available
+- `result["ensemble_stats"]` → kappa, stability, agreement_rate
+- `provider_insights["historical"]["validation"]` → max_deviation_pct
+- `self._evidence_pack_v2` → positive/negative/silent counts
+- `self._extra_phase_outputs["DELIBERATE"]` → tribunal_confidence_cap
+- `self._validation_reports["topology"]` → scale/type acceptable
+
+### Gotcha: tribunal_divergence data flow
+
+`build_quality_report()` does NOT read `result["deliberation_summary"]` — that key doesn't exist at the top level of the result dict. The actual data lives in `runtime._extra_phase_outputs["DELIBERATE"]`. The runtime must explicitly extract and pass `deliberation_summary` to `build_quality_report()`.
+
+---
+
+## PredictionContract Parser (R1)
+
+> Parses LLM output dicts into structured prediction contracts.
+
+### Key Function
+
+```python
+def parse_prediction_contract(
+    prediction: Any,          # LLM output dict
+    *,
+    skill_id: str = "",
+    evidence_pack_v2: Any = None,  # EvidencePackV2 for evidence_ids
+) -> PredictionContract: ...
+```
+
+### Field Detection Rules
+
+| Category | Detection | Unit |
+|----------|-----------|------|
+| Numeric metric | Key in `_NUMERIC_FIELDS` (impressions, engagement, etc.) | "count" |
+| Probability metric | Key in `_PROBABILITY_FIELDS` or contains "probability"/"prob" | "probability" |
+| Grade prediction | Key "grade" exists with string value | — |
+
+### Validation Warnings
+
+| Warning | Condition |
+|---------|-----------|
+| Quantile ordering | p50 > p80 or p80 > p95 |
+| Grade distribution sum | sum ≠ 1.0 (tolerance ±0.15) |
+| High confidence without evidence | confidence=HIGH and evidence_ids is empty |
+
+### Key Rules
+
+- Non-fatal: unknown dict structures return empty contract with warning
+- High confidence predictions auto-receive evidence_ids from EvidencePackV2 (up to 3)
+- Result written to `result["prediction_contract"]` — never overwrites `result["prediction"]`
+- Quantile fields searched as `{field}_p50`, `{field}_p80`, `{field}_p95`
+
+---
+
 ## Provider Insights (Output Contract)
 
 ### Scope / Trigger

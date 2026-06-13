@@ -745,8 +745,10 @@ def test_domain_example_index_json_output_is_agent_safe() -> None:
 
     first = payload["domains"][0]
     assert sorted(first.keys()) == ["description", "example_count", "examples", "name", "use_when", "version"]
-    assert first["examples"]
-    assert sorted(first["examples"][0].keys()) == ["name", "path", "selectors", "summary", "tags", "title", "use_when"]
+    # Find a domain that actually has examples (some skills like trellis-* may have 0)
+    domain_with_examples = next((d for d in payload["domains"] if d["examples"]), None)
+    assert domain_with_examples is not None, "At least one domain should have examples"
+    assert sorted(domain_with_examples["examples"][0].keys()) == ["name", "path", "selectors", "summary", "tags", "title", "use_when"]
 
 
 def test_domain_example_index_human_selector_text_is_not_misleading() -> None:
@@ -1909,6 +1911,8 @@ def test_job_list_includes_artifact_paths_in_json_and_human_output(
     assert human_result.exit_code == 0
     assert "产物文件" in human_result.stdout
     artifact_column = _extract_rich_table_column(human_result.stdout, 4)
+    # Rich table may wrap long paths across lines; normalize whitespace for matching
+    normalized_column = artifact_column.replace("\n", "")
     assert "详细日志：d" in artifact_column
     assert "emo.json" in artifact_column
     assert "精简日志：d" in artifact_column
@@ -1920,7 +1924,7 @@ def test_job_list_includes_artifact_paths_in_json_and_human_output(
     assert "产物目录：a" in artifact_column
     assert "rtifacts" in artifact_column
     assert "路径：" in artifact_column
-    assert "/artifacts" in artifact_column
+    assert "/artifacts" in normalized_column
 
 
 def test_job_list_human_table_separates_jobs_with_lines(tmp_path: Path) -> None:

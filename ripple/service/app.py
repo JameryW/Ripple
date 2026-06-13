@@ -56,6 +56,60 @@ def create_app() -> FastAPI:
             "ts": datetime.now(timezone.utc).isoformat(),
         }
 
+    @app.get("/v1/health/prediction-quality", dependencies=[Depends(require_bearer)])
+    def health_prediction_quality() -> dict:
+        """Check prediction quality subsystem health (R1-R8)."""
+        checks: dict[str, dict] = {}
+        try:
+            from ripple.primitives.prediction_quality import (
+                ConfidenceGate, ConfidenceLevel,
+                parse_prediction_contract, PredictionContract,
+            )
+            gate = ConfidenceGate()
+            gate_result = gate.evaluate("high", provider_available=True)
+            checks["confidence_gate"] = {
+                "ok": gate_result.final_confidence == ConfidenceLevel.HIGH,
+                "factors": len(gate_result.factors),
+            }
+
+            contract = parse_prediction_contract(
+                {"impressions": 50000, "confidence": "medium"},
+                skill_id="health-check",
+            )
+            checks["prediction_contract"] = {
+                "ok": isinstance(contract, PredictionContract) and len(contract.predictions) == 1,
+            }
+        except Exception as exc:
+            checks["confidence_gate"] = {"ok": False, "error": str(exc)}
+
+        try:
+            from ripple.providers.historical_calibrator import HistoricalCalibrator
+            calibrator = HistoricalCalibrator()
+            report = calibrator.calibrate({"views": 1000}, [{"views": 500}, {"views": 1500}])
+            checks["historical_calibrator"] = {"ok": report is not None}
+        except Exception as exc:
+            checks["historical_calibrator"] = {"ok": False, "error": str(exc)}
+
+        try:
+            from ripple.engine.quality_report import build_quality_report
+            qr = build_quality_report(
+                simulation_input={"event": {"title": "test"}},
+                result={"prediction": {"confidence": "medium"}},
+            )
+            checks["quality_report"] = {"ok": qr.input_completeness >= 0.0, "dimensions": len(qr.to_dict())}
+        except Exception as exc:
+            checks["quality_report"] = {"ok": False, "error": str(exc)}
+
+        try:
+            from ripple.backtest.schema import SCHEMA_VERSION
+            from ripple.backtest.metrics import compute_numeric_metrics
+            checks["backtest"] = {"ok": True, "schema_version": SCHEMA_VERSION}
+        except Exception as exc:
+            checks["backtest"] = {"ok": False, "error": str(exc)}
+
+        overall = all(bool(v.get("ok", False)) for v in checks.values())
+        return {"ok": overall, "checks": checks}
+
     @app.get("/v1/ping", dependencies=[Depends(require_bearer)])
     def ping() -> dict[str, str]:
         return {"ok": "true"}

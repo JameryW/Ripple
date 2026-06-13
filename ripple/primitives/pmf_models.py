@@ -29,13 +29,24 @@ class TribunalOpinion:
 
 @dataclass(frozen=True)
 class DeliberationRecord:
-    """合议庭单轮辩论记录。 / Single round deliberation record."""
+    """合议庭单轮辩论记录。 / Single round deliberation record.
+
+    R6: Tribunal audit formalization adds structured audit fields to the
+    final round's record for programmatic consumption.
+    """
     round_number: int
     opinions: List[TribunalOpinion]
     challenges: List[Dict[str, Any]]
     consensus_points: List[str]
     dissent_points: List[str]
     converged: bool = False  # v3: 双重闸门收敛标记 / Dual-gate convergence flag
+    # R6: Structured audit fields (populated on final round)
+    key_evidence: List[str] = field(default_factory=list)
+    uncertainties: List[str] = field(default_factory=list)
+    optimism_audit: List[str] = field(default_factory=list)
+    overrated_dimensions: List[str] = field(default_factory=list)
+    missing_evidence: List[str] = field(default_factory=list)
+    recommended_confidence_cap: Optional[str] = None  # "medium" | "low"
 
 
 @dataclass(frozen=True)
