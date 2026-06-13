@@ -139,3 +139,36 @@ Added top-level provider_insights to result dict showing provider activation sta
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Enrich SSE wave events and GET simulation API with runtime fields
+
+**Date**: 2026-06-13
+**Task**: Enrich SSE wave events and GET simulation API with runtime fields
+**Branch**: `feat/sse-wave-progress-and-api-runtime-fields`
+
+### Summary
+
+Added total_waves to SSE progress.wave_start/wave_end payload; enriched GET /v1/simulations/{job_id} with phase/progress/wave/total_waves runtime fields; verified job.completed timing (set_result→update_status→publish). All service+engine tests pass. PR #8 opened.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7a71151` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
