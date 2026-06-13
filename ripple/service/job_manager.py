@@ -62,6 +62,7 @@ class JobManager:
             payload={
                 "phase": event.phase,
                 "wave": event.wave,
+                "total_waves": event.total_waves,
                 "progress": event.progress,
                 "detail": event.detail or {},
                 "agent_id": event.agent_id,

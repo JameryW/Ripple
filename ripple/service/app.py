@@ -72,13 +72,22 @@ def create_app() -> FastAPI:
     @app.get("/v1/simulations/{job_id}", dependencies=[Depends(require_bearer)])
     def get_simulation(job_id: str) -> dict:
         row = _get_row(job_id)
-        return {
+        response = {
             "job_id": row["job_id"],
             "status": row["status"],
             "request": _load_json(row["request_json"]),
             "result": _load_json(row["result_json"]),
             "error": _load_json(row["error_json"]),
         }
+        if row.get("phase") is not None:
+            response["phase"] = row["phase"]
+        if row.get("progress") is not None:
+            response["progress"] = float(row["progress"])
+        if row.get("current_wave") is not None:
+            response["wave"] = int(row["current_wave"])
+        if row.get("total_waves") is not None:
+            response["total_waves"] = int(row["total_waves"])
+        return response
 
     @app.get("/v1/simulations/{job_id}/artifacts/compact-log", dependencies=[Depends(require_bearer)])
     def get_compact_log(job_id: str) -> PlainTextResponse:
