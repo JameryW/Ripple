@@ -177,9 +177,89 @@ class DeliberationOrchestrator:
                         f"Deliberation converged at round {round_num} "
                         f"after {consecutive_stable} consecutive stable transitions."
                     )
+                    # R6: Populate audit fields on the final converged record
+                    audit = self._aggregate_audit_from_agents()
+                    record = DeliberationRecord(
+                        round_number=record.round_number,
+                        opinions=record.opinions,
+                        challenges=record.challenges,
+                        consensus_points=record.consensus_points,
+                        dissent_points=record.dissent_points,
+                        converged=True,
+                        key_evidence=audit.get("key_evidence", []),
+                        uncertainties=audit.get("uncertainties", []),
+                        optimism_audit=audit.get("optimism_audit", []),
+                        overrated_dimensions=audit.get("overrated_dimensions", []),
+                        missing_evidence=audit.get("missing_evidence", []),
+                        recommended_confidence_cap=audit.get("recommended_confidence_cap"),
+                    )
+                    # Replace last record with audit-populated version
+                    records[-1] = record
                     break
 
+        # R6: If deliberation did not converge (loop ended without break),
+        # populate audit fields on the final record
+        if records and not records[-1].key_evidence and not records[-1].recommended_confidence_cap:
+            audit = self._aggregate_audit_from_agents()
+            last_record = records[-1]
+            records[-1] = DeliberationRecord(
+                round_number=last_record.round_number,
+                opinions=last_record.opinions,
+                challenges=last_record.challenges,
+                consensus_points=last_record.consensus_points,
+                dissent_points=last_record.dissent_points,
+                converged=last_record.converged,
+                key_evidence=audit.get("key_evidence", []),
+                uncertainties=audit.get("uncertainties", []),
+                optimism_audit=audit.get("optimism_audit", []),
+                overrated_dimensions=audit.get("overrated_dimensions", []),
+                missing_evidence=audit.get("missing_evidence", []),
+                recommended_confidence_cap=audit.get("recommended_confidence_cap"),
+            )
+
         return records
+
+    def _aggregate_audit_from_agents(self) -> Dict[str, Any]:
+        """R6: Aggregate audit fields from all tribunal agents' most recent LLM responses.
+
+        Collects key_evidence, uncertainties, optimism_audit, overrated_dimensions,
+        missing_evidence from all agents, and takes the most conservative
+        recommended_confidence_cap (lowest).
+        """
+        all_key_evidence: List[str] = []
+        all_uncertainties: List[str] = []
+        all_optimism_audit: List[str] = []
+        all_overrated_dimensions: List[str] = []
+        all_missing_evidence: List[str] = []
+        cap: Optional[str] = None
+
+        # Confidence cap ranking: low < medium < high
+        _cap_rank = {"low": 0, "medium": 1, "high": 2}
+
+        for agent in self._agents:
+            audit = getattr(agent, "_last_audit", {})
+            if not isinstance(audit, dict):
+                continue
+            all_key_evidence.extend(audit.get("key_evidence", []))
+            all_uncertainties.extend(audit.get("uncertainties", []))
+            all_optimism_audit.extend(audit.get("optimism_audit", []))
+            all_overrated_dimensions.extend(audit.get("overrated_dimensions", []))
+            all_missing_evidence.extend(audit.get("missing_evidence", []))
+
+            # Take the most conservative (lowest) confidence cap
+            agent_cap = audit.get("recommended_confidence_cap")
+            if agent_cap is not None:
+                if cap is None or _cap_rank.get(agent_cap, 1) < _cap_rank.get(cap, 1):
+                    cap = agent_cap
+
+        return {
+            "key_evidence": all_key_evidence,
+            "uncertainties": all_uncertainties,
+            "optimism_audit": all_optimism_audit,
+            "overrated_dimensions": all_overrated_dimensions,
+            "missing_evidence": all_missing_evidence,
+            "recommended_confidence_cap": cap,
+        }
 
     # ------------------------------------------------------------------
     # Internal methods

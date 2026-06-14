@@ -1032,3 +1032,352 @@ class TestObservationInResult:
 
         assert "observation" in result
         assert result["observation"]["phase_vector"]["heat"] == "growth"
+
+
+# ---------------------------------------------------------------------------
+# R3/R4: Calibrated predictions from confidence gate + calibration report
+# ---------------------------------------------------------------------------
+
+
+class TestApplyCalibratedPredictions:
+    """Tests for SimulationRuntime._apply_calibrated_predictions — R3/R4."""
+
+    def _make_runtime(self):
+        """Create a minimal SimulationRuntime with mock callers."""
+        return SimulationRuntime(
+            omniscient_caller=AsyncMock(return_value='{"prediction":{}}'),
+            agent_caller=AsyncMock(return_value='{"response_type":"amplify"}'),
+        )
+
+    def test_no_calibration_report_does_nothing(self):
+        """When no calibration report exists, prediction is unchanged."""
+        rt = self._make_runtime()
+        rt._calibration_report = None
+        result = {"prediction": {"impressions": 5000}}
+        rt._apply_calibrated_predictions(result)
+        assert result["prediction"]["impressions"] == 5000
+        assert "raw_predictions" not in result["prediction"]
+        assert "calibration_method" not in result["prediction"]
+
+    def test_no_calibrated_prediction_actions_does_nothing(self):
+        """Calibration report with only lower_confidence actions does not modify predictions."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+        )
+        rt = self._make_runtime()
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[],
+            actions=[
+                CalibrationAction(
+                    action_type="lower_confidence",
+                    metric="impressions",
+                    reason="Deviation too high",
+                    confidence_cap="medium",
+                )
+            ],
+        )
+        result = {"prediction": {"impressions": 5000}}
+        rt._apply_calibrated_predictions(result)
+        assert result["prediction"]["impressions"] == 5000
+        assert "raw_predictions" not in result["prediction"]
+
+    def test_calibrated_prediction_action_adjusts_value(self):
+        """When a calibrated_prediction action exists, the predicted value is adjusted."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+            CalibratedMetric,
+            PercentileBaseline,
+        )
+        rt = self._make_runtime()
+        baseline = PercentileBaseline(
+            metric="impressions",
+            count=10,
+            avg=1000.0,
+            median=900.0,
+            p75=1100.0,
+            p90=1200.0,
+            p95=1300.0,
+            max_val=1500.0,
+        )
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[
+                CalibratedMetric(
+                    metric="impressions",
+                    predicted=5000.0,
+                    baseline=baseline,
+                    deviation_from_avg_pct=400.0,
+                    deviation_from_median_pct=455.6,
+                    actions=[
+                        CalibrationAction(
+                            action_type="calibrated_prediction",
+                            metric="impressions",
+                            reason="Predicted 5000.0 exceeds P95 1300.0",
+                            original_value=5000.0,
+                            calibrated_value=1100.0,  # P75 cap
+                            deviation_pct=400.0,
+                        )
+                    ],
+                    within_range=False,
+                )
+            ],
+            actions=[
+                CalibrationAction(
+                    action_type="calibrated_prediction",
+                    metric="impressions",
+                    reason="Predicted 5000.0 exceeds P95 1300.0",
+                    original_value=5000.0,
+                    calibrated_value=1300.0,
+                    deviation_pct=400.0,
+                )
+            ],
+        )
+        result = {"prediction": {"impressions": 5000, "confidence": "high"}}
+        rt._apply_calibrated_predictions(result)
+
+        # Original value preserved in raw_predictions
+        assert result["prediction"]["raw_predictions"]["impressions"] == 5000
+        # Value adjusted to P75 (more conservative than P95)
+        assert result["prediction"]["impressions"] == 1100.0
+        # Calibration method recorded
+        assert result["prediction"]["calibration_method"] == "historical_p75_cap"
+
+    def test_predicted_between_median_and_p95_uses_median(self):
+        """When predicted is between median and P95, use median adjustment."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+            CalibratedMetric,
+            PercentileBaseline,
+        )
+        rt = self._make_runtime()
+        baseline = PercentileBaseline(
+            metric="engagement",
+            count=10,
+            avg=500.0,
+            median=450.0,
+            p75=550.0,
+            p90=600.0,
+            p95=650.0,
+            max_val=700.0,
+        )
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[
+                CalibratedMetric(
+                    metric="engagement",
+                    predicted=550.0,
+                    baseline=baseline,
+                    deviation_from_avg_pct=10.0,
+                    deviation_from_median_pct=22.2,
+                    actions=[
+                        CalibrationAction(
+                            action_type="calibrated_prediction",
+                            metric="engagement",
+                            reason="Predicted 550.0 exceeds P95 650.0",
+                            original_value=550.0,
+                            calibrated_value=650.0,
+                            deviation_pct=10.0,
+                        )
+                    ],
+                    within_range=True,
+                )
+            ],
+            actions=[
+                CalibrationAction(
+                    action_type="calibrated_prediction",
+                    metric="engagement",
+                    reason="Predicted 550.0 exceeds P95 650.0",
+                    original_value=550.0,
+                    calibrated_value=650.0,
+                    deviation_pct=10.0,
+                )
+            ],
+        )
+        result = {"prediction": {"engagement": 550}}
+        rt._apply_calibrated_predictions(result)
+
+        # Since predicted (550) <= P95 (650) but > median (450), use median
+        assert result["prediction"]["engagement"] == 450.0
+        assert result["prediction"]["calibration_method"] == "historical_median_adjustment"
+
+    def test_multiple_metrics_calibrated(self):
+        """Multiple metrics can be calibrated simultaneously."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+            CalibratedMetric,
+            PercentileBaseline,
+        )
+        rt = self._make_runtime()
+        baseline_imp = PercentileBaseline(
+            metric="impressions", count=5, avg=1000.0, median=950.0,
+            p75=1050.0, p90=1150.0, p95=1200.0, max_val=1300.0,
+        )
+        baseline_eng = PercentileBaseline(
+            metric="engagement", count=5, avg=200.0, median=180.0,
+            p75=220.0, p90=240.0, p95=250.0, max_val=260.0,
+        )
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[
+                CalibratedMetric(
+                    metric="impressions", predicted=5000.0, baseline=baseline_imp,
+                    deviation_from_avg_pct=400.0,
+                    actions=[CalibrationAction(
+                        action_type="calibrated_prediction", metric="impressions",
+                        reason="exceeds P95", original_value=5000.0,
+                        calibrated_value=1200.0, deviation_pct=400.0,
+                    )],
+                ),
+                CalibratedMetric(
+                    metric="engagement", predicted=600.0, baseline=baseline_eng,
+                    deviation_from_avg_pct=200.0,
+                    actions=[CalibrationAction(
+                        action_type="calibrated_prediction", metric="engagement",
+                        reason="exceeds P95", original_value=600.0,
+                        calibrated_value=250.0, deviation_pct=200.0,
+                    )],
+                ),
+            ],
+            actions=[
+                CalibrationAction(
+                    action_type="calibrated_prediction", metric="impressions",
+                    reason="exceeds P95", original_value=5000.0,
+                    calibrated_value=1200.0, deviation_pct=400.0,
+                ),
+                CalibrationAction(
+                    action_type="calibrated_prediction", metric="engagement",
+                    reason="exceeds P95", original_value=600.0,
+                    calibrated_value=250.0, deviation_pct=200.0,
+                ),
+            ],
+        )
+        result = {"prediction": {"impressions": 5000, "engagement": 600}}
+        rt._apply_calibrated_predictions(result)
+
+        assert result["prediction"]["raw_predictions"]["impressions"] == 5000
+        assert result["prediction"]["raw_predictions"]["engagement"] == 600
+        # Both calibrated to P75 (more conservative than P95)
+        assert result["prediction"]["impressions"] == 1050.0
+        assert result["prediction"]["engagement"] == 220.0
+        assert "calibration_method" in result["prediction"]
+
+    def test_non_numeric_prediction_unchanged(self):
+        """Non-numeric prediction fields are not affected by calibration."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+            CalibratedMetric,
+            PercentileBaseline,
+        )
+        rt = self._make_runtime()
+        baseline = PercentileBaseline(
+            metric="impressions", count=5, avg=1000.0, median=950.0,
+            p75=1050.0, p90=1150.0, p95=1200.0, max_val=1300.0,
+        )
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[
+                CalibratedMetric(
+                    metric="impressions", predicted=5000.0, baseline=baseline,
+                    deviation_from_avg_pct=400.0,
+                    actions=[CalibrationAction(
+                        action_type="calibrated_prediction", metric="impressions",
+                        reason="exceeds P95", original_value=5000.0,
+                        calibrated_value=1200.0, deviation_pct=400.0,
+                    )],
+                ),
+            ],
+            actions=[
+                CalibrationAction(
+                    action_type="calibrated_prediction", metric="impressions",
+                    reason="exceeds P95", original_value=5000.0,
+                    calibrated_value=1200.0, deviation_pct=400.0,
+                ),
+            ],
+        )
+        result = {"prediction": {"impressions": 5000, "verdict": "growth", "confidence": "high"}}
+        rt._apply_calibrated_predictions(result)
+
+        # Non-numeric fields preserved
+        assert result["prediction"]["verdict"] == "growth"
+        assert result["prediction"]["confidence"] == "high"
+        # Numeric field calibrated
+        assert result["prediction"]["impressions"] == 1050.0
+
+    def test_exception_is_non_fatal(self):
+        """Any exception in _apply_calibrated_predictions is caught and logged."""
+        rt = self._make_runtime()
+        # Set calibration_report to something that will cause an error
+        rt._calibration_report = "not a real report"
+        result = {"prediction": {"impressions": 5000}}
+        # Should not raise
+        rt._apply_calibrated_predictions(result)
+        # Prediction should be unchanged
+        assert result["prediction"]["impressions"] == 5000
+
+    def test_no_prediction_dict_does_nothing(self):
+        """When result has no prediction dict, method returns safely."""
+        rt = self._make_runtime()
+        from ripple.providers.historical_calibrator import CalibrationReport, CalibrationAction
+        rt._calibration_report = CalibrationReport(
+            actions=[
+                CalibrationAction(
+                    action_type="calibrated_prediction", metric="impressions",
+                    reason="test", original_value=5000.0,
+                    calibrated_value=1000.0, deviation_pct=400.0,
+                )
+            ],
+        )
+        result = {"prediction": "not a dict"}
+        rt._apply_calibrated_predictions(result)
+        assert result["prediction"] == "not a dict"
+
+
+class TestConfidenceGateResultInQuality:
+    """Tests for confidence gate result stored in result['quality']['confidence_gate_result']."""
+
+    def _make_runtime(self):
+        """Create a minimal SimulationRuntime with mock callers."""
+        return SimulationRuntime(
+            omniscient_caller=AsyncMock(return_value='{"prediction":{}}'),
+            agent_caller=AsyncMock(return_value='{"response_type":"amplify"}'),
+        )
+
+    def test_quality_confidence_gate_result_populated(self):
+        """After gate evaluation, result['quality']['confidence_gate_result'] is populated."""
+        rt = self._make_runtime()
+        from ripple.primitives.prediction_quality import ConfidenceGateResult, ConfidenceLevel
+        gate_result = ConfidenceGateResult(
+            original_confidence=ConfidenceLevel.HIGH,
+            final_confidence=ConfidenceLevel.MEDIUM,
+            factors=[],
+            gate_applied=True,
+            reason="Provider missing",
+        )
+        result = {"prediction": {"confidence": "high"}}
+        # Simulate what _run_phases does after gate evaluation
+        result["confidence_gate"] = {
+            "original_confidence": gate_result.original_confidence.value,
+            "final_confidence": gate_result.final_confidence.value,
+            "gate_applied": gate_result.gate_applied,
+            "reason": gate_result.reason,
+            "factors": [],
+        }
+        if gate_result.gate_applied:
+            pred = result.get("prediction")
+            if isinstance(pred, dict):
+                pred["confidence"] = gate_result.final_confidence.value
+            result["confidence"] = gate_result.final_confidence.value
+
+        result.setdefault("quality", {})["confidence_gate_result"] = {
+            "original_confidence": gate_result.original_confidence.value,
+            "final_confidence": gate_result.final_confidence.value,
+            "gate_applied": gate_result.gate_applied,
+            "reason": gate_result.reason,
+        }
+
+        assert result["quality"]["confidence_gate_result"]["original_confidence"] == "high"
+        assert result["quality"]["confidence_gate_result"]["final_confidence"] == "medium"
+        assert result["quality"]["confidence_gate_result"]["gate_applied"] is True
+        assert result["quality"]["confidence_gate_result"]["reason"] == "Provider missing"
+

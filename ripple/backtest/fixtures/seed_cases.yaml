@@ -1,0 +1,237 @@
+# Backtest seed fixtures for Ripple prediction quality calibration.
+#
+# These cases are SYNTHETIC but modeled on realistic social-media prediction
+# scenarios.  They are NOT real user data.  Each case pairs a prediction-time
+# input with a known ground-truth outcome so that the backtest runner can
+# measure error without calling an LLM.
+#
+# Case categories:
+#   optimistic  - LLM over-predicted by 3-5x vs reality
+#   conservative - LLM under-predicted vs reality
+#   calibrated  - prediction within ~30% of reality
+#
+# Format follows BacktestCase schema v1.0 (ripple/backtest/schema.py).
+
+- case_id: "opt-xhs-video-001"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["optimistic", "xiaohongshu", "video"]
+  platform: "xiaohongshu"
+  channel: "generic"
+  vertical: "beauty"
+  time_window: "48h"
+  content_type: "video"
+  simulation_input:
+    event:
+      title: "XHS beauty vlogger seasonal makeup tutorial"
+      platform: "xiaohongshu"
+      content_type: "video"
+      follower_count: 15000
+    simulation_horizon: "48h"
+  ground_truth:
+    impressions: 8500
+    engagement: 680
+    reach: 6200
+    likes: 450
+    comments: 120
+    shares: 45
+    virality_probability: 0.05
+    breakout_probability: 0.02
+    long_tail_probability: 0.15
+    conversion: 30
+
+- case_id: "opt-xhs-text-002"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["optimistic", "xiaohongshu", "text"]
+  platform: "xiaohongshu"
+  channel: "generic"
+  vertical: "food"
+  time_window: "24h"
+  content_type: "text"
+  simulation_input:
+    event:
+      title: "XHS food review for local restaurant"
+      platform: "xiaohongshu"
+      content_type: "text"
+      follower_count: 3000
+    simulation_horizon: "24h"
+  ground_truth:
+    impressions: 2200
+    engagement: 180
+    reach: 1600
+    likes: 110
+    comments: 40
+    shares: 15
+    virality_probability: 0.02
+    breakout_probability: 0.01
+    long_tail_probability: 0.20
+    conversion: 8
+
+- case_id: "opt-weibo-topic-003"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["optimistic", "weibo", "text"]
+  platform: "weibo"
+  channel: "hot-topic"
+  vertical: "entertainment"
+  time_window: "48h"
+  content_type: "text"
+  simulation_input:
+    event:
+      title: "Weibo celebrity gossip trending topic"
+      platform: "weibo"
+      content_type: "text"
+      follower_count: 500000
+    simulation_horizon: "48h"
+  ground_truth:
+    impressions: 180000
+    engagement: 12000
+    reach: 95000
+    likes: 8000
+    comments: 3000
+    shares: 900
+    virality_probability: 0.15
+    breakout_probability: 0.08
+    long_tail_probability: 0.10
+    conversion: 250
+
+- case_id: "con-xhs-video-004"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["conservative", "xiaohongshu", "video"]
+  platform: "xiaohongshu"
+  channel: "generic"
+  vertical: "travel"
+  time_window: "48h"
+  content_type: "video"
+  simulation_input:
+    event:
+      title: "XHS travel vlogger hidden gem destination"
+      platform: "xiaohongshu"
+      content_type: "video"
+      follower_count: 80000
+    simulation_horizon: "48h"
+  ground_truth:
+    impressions: 95000
+    engagement: 9500
+    reach: 72000
+    likes: 6800
+    comments: 1200
+    shares: 850
+    virality_probability: 0.25
+    breakout_probability: 0.18
+    long_tail_probability: 0.35
+    conversion: 480
+
+- case_id: "con-weibo-text-005"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["conservative", "weibo", "text"]
+  platform: "weibo"
+  channel: "brand-official"
+  vertical: "tech"
+  time_window: "24h"
+  content_type: "text"
+  simulation_input:
+    event:
+      title: "Weibo tech brand product launch announcement"
+      platform: "weibo"
+      content_type: "text"
+      follower_count: 2000000
+    simulation_horizon: "24h"
+  ground_truth:
+    impressions: 850000
+    engagement: 75000
+    reach: 620000
+    likes: 55000
+    comments: 12000
+    shares: 4500
+    virality_probability: 0.40
+    breakout_probability: 0.30
+    long_tail_probability: 0.25
+    conversion: 3200
+
+- case_id: "cal-xhs-video-006"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["calibrated", "xiaohongshu", "video"]
+  platform: "xiaohongshu"
+  channel: "generic"
+  vertical: "fashion"
+  time_window: "48h"
+  content_type: "video"
+  simulation_input:
+    event:
+      title: "XHS fashion OOTD mid-tier influencer post"
+      platform: "xiaohongshu"
+      content_type: "video"
+      follower_count: 45000
+    simulation_horizon: "48h"
+  ground_truth:
+    impressions: 38000
+    engagement: 3800
+    reach: 28000
+    likes: 2600
+    comments: 500
+    shares: 320
+    virality_probability: 0.12
+    breakout_probability: 0.06
+    long_tail_probability: 0.22
+    conversion: 190
+
+- case_id: "cal-weibo-video-007"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["calibrated", "weibo", "video"]
+  platform: "weibo"
+  channel: "kol"
+  vertical: "lifestyle"
+  time_window: "48h"
+  content_type: "video"
+  simulation_input:
+    event:
+      title: "Weibo lifestyle KOL product recommendation"
+      platform: "weibo"
+      content_type: "video"
+      follower_count: 300000
+    simulation_horizon: "48h"
+  ground_truth:
+    impressions: 250000
+    engagement: 22500
+    reach: 180000
+    likes: 16000
+    comments: 3500
+    shares: 1800
+    virality_probability: 0.18
+    breakout_probability: 0.10
+    long_tail_probability: 0.20
+    conversion: 1100
+
+- case_id: "cal-xhs-text-008"
+  schema_version: "1.0"
+  skill_id: "social-media"
+  tags: ["calibrated", "xiaohongshu", "text"]
+  platform: "xiaohongshu"
+  channel: "generic"
+  vertical: "education"
+  time_window: "24h"
+  content_type: "text"
+  simulation_input:
+    event:
+      title: "XHS education study tips sharing"
+      platform: "xiaohongshu"
+      content_type: "text"
+      follower_count: 8000
+    simulation_horizon: "24h"
+  ground_truth:
+    impressions: 5500
+    engagement: 440
+    reach: 4000
+    likes: 280
+    comments: 80
+    shares: 35
+    virality_probability: 0.04
+    breakout_probability: 0.02
+    long_tail_probability: 0.18
+    conversion: 18

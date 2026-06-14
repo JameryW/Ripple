@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Phase 2 extends HistoricalValidator into calibrator and adds calibration actions to provider_insights — must conform to existing provider contracts"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Calibration actions flow from providers→runtime→result→recorder→API; ensemble distribution spans simulate.py→ensemble.py→runtime.py→recorder"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Must reuse existing HistoricalValidator, TopologyValidator, aggregate_ordinal_scores, compute_fleiss_kappa rather than reimplementing"}
+{"file": ".trellis/tasks/06-13-prediction-quality-accuracy/prd.md", "reason": "Phase 2 scope definition: R3 provider calibration, R4 historical calibrator, R5 ensemble distribution, R6 tribunal audit formalization"}

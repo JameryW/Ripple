@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Verify backtest and quality report follow non-fatal, logged patterns"}
+{"file": ".trellis/tasks/06-13-prediction-quality-accuracy/prd.md", "reason": "Verify R7/R8 acceptance criteria met: versioned schema, MAE/MAPE/RMSE/Brier/F1, 9-dimension quality report"}

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Verify calibration actions and confidence gates conform to provider protocol contracts, YAML config, and validation error matrix"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify quality gates follow non-fatal, logged, graceful fallback patterns — calibration must not crash the simulation"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify new quality fields propagate correctly from runtime → recorder → API response without breaking existing consumers"}
+{"file": ".trellis/tasks/06-13-prediction-quality-accuracy/prd.md", "reason": "Verify implementation matches acceptance criteria, backward compat requirements, and phase boundaries"}

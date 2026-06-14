@@ -47,6 +47,48 @@ def _safe_int_score(value: Any, default: int = 3) -> int:
     return default
 
 
+def _safe_str_list(value: Any) -> List[str]:
+    """Coerce an audit field value to a list of strings.
+
+    LLM may return: a list of strings, a single string, None, or other types.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None and str(item).strip()]
+    return [str(value)]
+
+
+def _extract_audit_from_llm_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract and validate R6 audit fields from parsed LLM JSON.
+
+    Returns a dict with the 6 R6 audit fields, with defaults for missing ones.
+    """
+    audit_raw = data.get("audit", {})
+    if not isinstance(audit_raw, dict):
+        audit_raw = {}
+    return {
+        "key_evidence": _safe_str_list(audit_raw.get("key_evidence")),
+        "uncertainties": _safe_str_list(audit_raw.get("uncertainties")),
+        "optimism_audit": _safe_str_list(audit_raw.get("optimism_audit")),
+        "overrated_dimensions": _safe_str_list(audit_raw.get("overrated_dimensions")),
+        "missing_evidence": _safe_str_list(audit_raw.get("missing_evidence")),
+        "recommended_confidence_cap": _safe_str_cap(audit_raw.get("recommended_confidence_cap")),
+    }
+
+
+def _safe_str_cap(value: Any) -> Optional[str]:
+    """Normalize a confidence cap value to 'low'|'medium'|'high' or None."""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in ("low", "medium", "high"):
+        return s
+    return None
+
+
 class TribunalAgent:
     """合议庭评审员：专业角色评估器。 / Tribunal Agent: professional role evaluator."""
 
@@ -65,6 +107,8 @@ class TribunalAgent:
         self._llm_caller = llm_caller
         self._system_prompt = system_prompt
         self._max_retries = max_retries
+        # R6: Last parsed audit fields from the most recent LLM response
+        self._last_audit: Dict[str, Any] = {}
 
     async def _call_llm(
         self, user_prompt: str, call_timeout: Optional[float] = None
@@ -98,6 +142,27 @@ class TribunalAgent:
         round_number: int = 0,
     ) -> TribunalOpinion:
         """独立评估：基于证据输出评分卡和叙事。 / Independent evaluation: output scorecard and narrative based on evidence."""
+        audit_instruction = (
+            "\n\nAdditionally, include an \"audit\" section in your JSON response:\n"
+            "```json\n"
+            "{\"scores\": {...}, \"narrative\": \"...\", "
+            "\"audit\": {"
+            "\"key_evidence\": [\"evidence item 1\", \"evidence item 2\"], "
+            "\"uncertainties\": [\"uncertain area 1\"], "
+            "\"optimism_audit\": [\"optimism risk 1\"], "
+            "\"overrated_dimensions\": [\"dimension name: reason\"], "
+            "\"missing_evidence\": [\"missing data 1\"], "
+            "\"recommended_confidence_cap\": \"medium\""
+            "}}\n"
+            "```\n"
+            "- key_evidence: list of the most important evidence items supporting your assessment\n"
+            "- uncertainties: areas where you lack confidence in your own assessment\n"
+            "- optimism_audit: specific risks that the simulation may be overly optimistic\n"
+            "- overrated_dimensions: dimensions where you believe other evaluators may score too high, with reasons\n"
+            "- missing_evidence: critical data or evidence that is missing but would change your assessment\n"
+            "- recommended_confidence_cap: \"low\", \"medium\", or \"high\" — your recommendation for "
+            "the maximum confidence level the final prediction should claim\n"
+        )
         prompt = (
             f"You are a {self.role} with expertise in {self.expertise}.\n"
             f"Your evaluation perspective: {self.perspective}\n\n"
@@ -105,6 +170,7 @@ class TribunalAgent:
             f"## Scoring rubric\n{rubric}\n\n"
             f"## Dimensions to evaluate\n{', '.join(dimensions)}\n\n"
             'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "your analysis"}'
+            + audit_instruction
         )
         last_error = None
         for attempt in range(1 + self._max_retries):
@@ -114,6 +180,8 @@ class TribunalAgent:
                 scores = {
                     k: _safe_int_score(v) for k, v in data.get("scores", {}).items()
                 }
+                # R6: Extract audit fields from LLM response
+                self._last_audit = _extract_audit_from_llm_data(data)
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
@@ -129,6 +197,7 @@ class TribunalAgent:
         logger.error(
             f"TribunalAgent {self.role} evaluate failed after retries: {last_error}"
         )
+        self._last_audit = {}
         return TribunalOpinion(
             member_role=self.role,
             scores={d: 3 for d in dimensions},
@@ -163,6 +232,27 @@ class TribunalAgent:
     ) -> TribunalOpinion:
         """基于质疑修正立场。 / Revise position based on challenges received."""
         challenges_text = "\n".join(f"- {c}" for c in challenges)
+        audit_instruction = (
+            "\n\nInclude an \"audit\" section in your JSON response:\n"
+            "```json\n"
+            "{\"scores\": {...}, \"narrative\": \"...\", "
+            "\"audit\": {"
+            "\"key_evidence\": [\"evidence item 1\"], "
+            "\"uncertainties\": [\"uncertain area 1\"], "
+            "\"optimism_audit\": [\"optimism risk 1\"], "
+            "\"overrated_dimensions\": [\"dimension name: reason\"], "
+            "\"missing_evidence\": [\"missing data 1\"], "
+            "\"recommended_confidence_cap\": \"medium\""
+            "}}\n"
+            "```\n"
+            "The audit fields help the system calibrate final prediction quality:\n"
+            "- key_evidence: most important evidence items\n"
+            "- uncertainties: areas where you lack confidence\n"
+            "- optimism_audit: risks of over-optimism\n"
+            "- overrated_dimensions: dimensions others may over-score\n"
+            "- missing_evidence: critical missing data\n"
+            "- recommended_confidence_cap: \"low\", \"medium\", or \"high\" — recommended max confidence\n"
+        )
         prompt = (
             f"You are a {self.role}. Your perspective: {self.perspective}\n\n"
             f"Your previous assessment (round {original_opinion.round_number}):\n"
@@ -171,6 +261,7 @@ class TribunalAgent:
             f"Challenges received:\n{challenges_text}\n\n"
             "Revise your assessment. You may keep, raise, or lower scores.\n"
             'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "revised analysis"}'
+            + audit_instruction
         )
         last_error = None
         for attempt in range(1 + self._max_retries):
@@ -180,6 +271,8 @@ class TribunalAgent:
                 scores = {
                     k: _safe_int_score(v) for k, v in data.get("scores", {}).items()
                 }
+                # R6: Extract audit fields from LLM response
+                self._last_audit = _extract_audit_from_llm_data(data)
                 return TribunalOpinion(
                     member_role=self.role,
                     scores=scores,
@@ -192,6 +285,7 @@ class TribunalAgent:
                     f"TribunalAgent {self.role} revise attempt {attempt + 1} failed: {e}"
                 )
 
+        self._last_audit = {}
         return TribunalOpinion(
             member_role=self.role,
             scores=dict(original_opinion.scores),
