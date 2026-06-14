@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-06-13
+- **Total Sessions**: 7
+- **Last Active**: 2026-06-14
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~210 | Active |
+| `journal-1.md` | ~243 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-06-14 | Close prediction quality loop: calibration rewrites, tribunal audit, SSE fields, backtest fixtures | `1e38d94` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 6 | 2026-06-13 | Implement prediction quality framework R1-R8 | `b38c393`, `5bc79ed`, `c129ce9`, `06a63a5` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 5 | 2026-06-13 | Enrich SSE wave events and GET simulation API with runtime fields | `7a71151` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 4 | 2026-06-05 | Provider Insights: surface provider usage in simulation output | `5eda19c`, `ebb1e60` | `main` |
