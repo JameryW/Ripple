@@ -111,3 +111,57 @@ class TestQualityReport:
             result={"prediction": {}},
         )
         assert report.tribunal_divergence is None
+
+    def test_ensemble_stability_picks_worst_level(self):
+        """Ensemble stability should pick the worst (lowest) level across dimensions."""
+        result = {
+            "prediction": {},
+            "ensemble_stats": {
+                "dimension_aggregates": {
+                    "reach": {"stability_level": "high"},
+                    "engagement": {"stability_level": "low"},
+                    "virality": {"stability_level": "medium"},
+                },
+            },
+        }
+        report = build_quality_report(
+            simulation_input={"event": {"title": "Test"}},
+            result=result,
+        )
+        # "low" is worst — should be selected, not "high"
+        assert report.ensemble_stability == "low"
+
+    def test_ensemble_stability_all_high(self):
+        """When all dimensions have high stability, report high."""
+        result = {
+            "prediction": {},
+            "ensemble_stats": {
+                "dimension_aggregates": {
+                    "reach": {"stability_level": "high"},
+                    "engagement": {"stability_level": "high"},
+                },
+            },
+        }
+        report = build_quality_report(
+            simulation_input={"event": {"title": "Test"}},
+            result=result,
+        )
+        assert report.ensemble_stability == "high"
+
+    def test_ensemble_stability_with_low_flags_risk(self):
+        """Low ensemble stability should be flagged as a residual risk."""
+        result = {
+            "prediction": {},
+            "ensemble_stats": {
+                "dimension_aggregates": {
+                    "reach": {"stability_level": "low"},
+                },
+            },
+        }
+        report = build_quality_report(
+            simulation_input={"event": {"title": "Test"}},
+            result=result,
+        )
+        assert report.ensemble_stability == "low"
+        risk_texts = " ".join(report.residual_risks)
+        assert "Low ensemble stability" in risk_texts

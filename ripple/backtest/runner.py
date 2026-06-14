@@ -97,6 +97,7 @@ async def run_backtest(
     numeric = compute_numeric_metrics(results)
     report.mae = numeric.get("mae")
     report.mape = numeric.get("mape")
+    report.signed_mape = numeric.get("signed_mape")
     report.rmse = numeric.get("rmse")
 
     grade = compute_grade_metrics(results)
@@ -126,6 +127,7 @@ async def run_backtest(
             "count": len(bucket_results),
             "mae": bucket_numeric.get("mae"),
             "mape": bucket_numeric.get("mape"),
+            "signed_mape": bucket_numeric.get("signed_mape"),
             "rmse": bucket_numeric.get("rmse"),
             "macro_f1": bucket_grade.get("macro_f1"),
         }

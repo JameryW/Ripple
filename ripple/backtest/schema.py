@@ -65,6 +65,7 @@ class PredictionError:
     actual: float
     absolute_error: float
     percentage_error: Optional[float] = None  # None when actual == 0
+    signed_percentage_error: Optional[float] = None  # symmetric signed MAPE term; None when predicted+actual == 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ class BacktestReport:
     # Numeric metrics (aggregated across all cases)
     mae: Optional[float] = None  # Mean Absolute Error
     mape: Optional[float] = None  # Mean Absolute Percentage Error
+    signed_mape: Optional[float] = None  # Symmetric signed MAPE (positive=over-predict, negative=under-predict)
     rmse: Optional[float] = None  # Root Mean Square Error
 
     # Grade metrics

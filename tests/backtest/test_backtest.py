@@ -98,6 +98,47 @@ class TestNumericMetrics:
         metrics = compute_numeric_metrics([])
         assert metrics["mae"] is None
 
+    def test_signed_mape(self):
+        """Signed symmetric MAPE: positive=over-predict, negative=under-predict."""
+        results = [
+            BacktestResult(case_id="1", prediction={}, errors=[
+                PredictionError(
+                    metric="views", predicted=1200, actual=1000,
+                    absolute_error=200, percentage_error=20,
+                    signed_percentage_error=18.18,  # (1200-1000)/((1200+1000)/2)*100
+                ),
+            ]),
+            BacktestResult(case_id="2", prediction={}, errors=[
+                PredictionError(
+                    metric="views", predicted=800, actual=1000,
+                    absolute_error=200, percentage_error=20,
+                    signed_percentage_error=-22.22,  # (800-1000)/((800+1000)/2)*100
+                ),
+            ]),
+        ]
+        metrics = compute_numeric_metrics(results)
+        assert metrics["signed_mape"] is not None
+        # Average of 18.18 and -22.22 ≈ -2.02
+        assert metrics["signed_mape"] < 0  # net under-prediction
+
+    def test_signed_mape_empty(self):
+        """Signed MAPE is None when no errors."""
+        metrics = compute_numeric_metrics([])
+        assert metrics["signed_mape"] is None
+
+    def test_signed_percentage_error_in_compute_prediction_errors(self):
+        """compute_prediction_errors should populate signed_percentage_error."""
+        errors = compute_prediction_errors(
+            {"views": 1200},
+            {"views": 1000},
+        )
+        assert len(errors) == 1
+        e = errors[0]
+        assert e.signed_percentage_error is not None
+        assert e.signed_percentage_error > 0  # over-prediction
+        # (1200-1000)/((1200+1000)/2)*100 = 200/1100*100 ≈ 18.18
+        assert abs(e.signed_percentage_error - 18.1818) < 0.01
+
 
 class TestGradeMetrics:
     def test_confusion_matrix(self):

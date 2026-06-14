@@ -1144,7 +1144,7 @@ class TestApplyCalibratedPredictions:
         assert result["prediction"]["calibration_method"] == "historical_p75_cap"
 
     def test_predicted_between_median_and_p95_uses_median(self):
-        """When predicted is between median and P95, use median adjustment."""
+        """When predicted is between median and P95, median_adjustment action applies median value."""
         from ripple.providers.historical_calibrator import (
             CalibrationAction,
             CalibrationReport,
@@ -1172,11 +1172,11 @@ class TestApplyCalibratedPredictions:
                     deviation_from_median_pct=22.2,
                     actions=[
                         CalibrationAction(
-                            action_type="calibrated_prediction",
+                            action_type="median_adjustment",
                             metric="engagement",
-                            reason="Predicted 550.0 exceeds P95 650.0",
+                            reason="Predicted 550.0 between median 450.0 and P95 650.0",
                             original_value=550.0,
-                            calibrated_value=650.0,
+                            calibrated_value=450.0,
                             deviation_pct=10.0,
                         )
                     ],
@@ -1185,11 +1185,11 @@ class TestApplyCalibratedPredictions:
             ],
             actions=[
                 CalibrationAction(
-                    action_type="calibrated_prediction",
+                    action_type="median_adjustment",
                     metric="engagement",
-                    reason="Predicted 550.0 exceeds P95 650.0",
+                    reason="Predicted 550.0 between median 450.0 and P95 650.0",
                     original_value=550.0,
-                    calibrated_value=650.0,
+                    calibrated_value=450.0,
                     deviation_pct=10.0,
                 )
             ],
@@ -1197,9 +1197,67 @@ class TestApplyCalibratedPredictions:
         result = {"prediction": {"engagement": 550}}
         rt._apply_calibrated_predictions(result)
 
-        # Since predicted (550) <= P95 (650) but > median (450), use median
+        # median_adjustment action applies the median value (450)
         assert result["prediction"]["engagement"] == 450.0
         assert result["prediction"]["calibration_method"] == "historical_median_adjustment"
+
+    def test_median_adjustment_action_applies_median_from_calibrator(self):
+        """median_adjustment action from calibrator → runtime applies median value."""
+        from ripple.providers.historical_calibrator import (
+            CalibrationAction,
+            CalibrationReport,
+            CalibratedMetric,
+            PercentileBaseline,
+        )
+        rt = self._make_runtime()
+        baseline = PercentileBaseline(
+            metric="engagement",
+            count=10,
+            avg=500.0,
+            median=450.0,
+            p75=550.0,
+            p90=600.0,
+            p95=650.0,
+            max_val=700.0,
+        )
+        rt._calibration_report = CalibrationReport(
+            calibrated_metrics=[
+                CalibratedMetric(
+                    metric="engagement",
+                    predicted=550.0,
+                    baseline=baseline,
+                    deviation_from_avg_pct=10.0,
+                    deviation_from_median_pct=22.2,
+                    actions=[
+                        CalibrationAction(
+                            action_type="median_adjustment",
+                            metric="engagement",
+                            reason="Predicted 550.0 between median 450.0 and P95 650.0",
+                            original_value=550.0,
+                            calibrated_value=450.0,
+                            deviation_pct=10.0,
+                        )
+                    ],
+                    within_range=True,
+                )
+            ],
+            actions=[
+                CalibrationAction(
+                    action_type="median_adjustment",
+                    metric="engagement",
+                    reason="Predicted 550.0 between median 450.0 and P95 650.0",
+                    original_value=550.0,
+                    calibrated_value=450.0,
+                    deviation_pct=10.0,
+                )
+            ],
+        )
+        result = {"prediction": {"engagement": 550}}
+        rt._apply_calibrated_predictions(result)
+
+        assert result["prediction"]["engagement"] == 450.0
+        assert result["prediction"]["calibration_method"] == "historical_median_adjustment"
+        assert result["prediction"]["raw_predictions"]["engagement"] == 550
 
     def test_multiple_metrics_calibrated(self):
         """Multiple metrics can be calibrated simultaneously."""

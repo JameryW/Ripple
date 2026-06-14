@@ -1753,7 +1753,7 @@ class SimulationRuntime:
                     if sl:
                         stability_levels.add(sl)
             if stability_levels:
-                ensemble_stability = min(stability_levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))
+                ensemble_stability = max(stability_levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))
         agreement_rate = ensemble_stats.get("grade_agreement_rate") if isinstance(ensemble_stats, dict) else None
 
         # Factor 3: Historical deviation
@@ -1835,42 +1835,41 @@ class SimulationRuntime:
             return
 
         try:
-            # Collect calibrated_prediction actions: metric -> calibrated_value
+            # Collect calibrated_prediction and median_adjustment actions: metric -> calibrated_value
             calibrations: Dict[str, Dict[str, Any]] = {}
+            has_p95_cap = False
+            has_median_adj = False
             for action in self._calibration_report.actions:
-                if action.action_type == "calibrated_prediction" and action.calibrated_value is not None:
+                if action.action_type in ("calibrated_prediction", "median_adjustment") and action.calibrated_value is not None:
                     calibrations[action.metric] = {
                         "calibrated_value": action.calibrated_value,
                         "original_value": action.original_value,
                         "deviation_pct": action.deviation_pct,
+                        "action_type": action.action_type,
                     }
+                    if action.action_type == "calibrated_prediction":
+                        has_p95_cap = True
+                    elif action.action_type == "median_adjustment":
+                        has_median_adj = True
 
             if not calibrations:
                 return
 
-            # Determine calibration method from the worst action
-            methods: List[str] = []
-            for action in self._calibration_report.actions:
-                if action.action_type == "calibrated_prediction":
-                    methods.append("historical_p95_cap")
-                    break
-            if not methods:
-                methods.append("historical_median_adjustment")
+            # Determine calibration method from the most severe action type present
+            if has_p95_cap:
+                calibration_method = "historical_p95_cap"
+            elif has_median_adj:
+                calibration_method = "historical_median_adjustment"
+            else:
+                calibration_method = "unknown"
 
-            calibration_method = methods[0]
-
-            # For metrics with calibrated_prediction actions, also check
-            # if they have a PercentileBaseline in calibrated_metrics
+            # For calibrated_prediction actions with a PercentileBaseline,
+            # use P75 as a more conservative cap when predicted > P95
             for cm in self._calibration_report.calibrated_metrics:
                 if cm.metric in calibrations and cm.baseline is not None:
-                    # If predicted > P95, use P75 as the cap (more conservative)
-                    # Otherwise, use the calibrated value (P95 cap from the action)
-                    if cm.predicted > cm.baseline.p95:
+                    if calibrations[cm.metric]["action_type"] == "calibrated_prediction" and cm.predicted > cm.baseline.p95:
                         calibrations[cm.metric]["calibrated_value"] = round(cm.baseline.p75, 2)
                         calibration_method = "historical_p75_cap"
-                    elif cm.predicted > cm.baseline.median:
-                        calibrations[cm.metric]["calibrated_value"] = round(cm.baseline.median, 2)
-                        calibration_method = "historical_median_adjustment"
 
             # Preserve original predictions
             raw_predictions: Dict[str, Any] = {}

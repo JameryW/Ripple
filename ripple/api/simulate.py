@@ -756,7 +756,8 @@ async def _run_ensemble(
             return {}
 
         _SKIP = {"step", "tick", "t", "phase", "agent_id", "id", "timestamp",
-                 "confidence", "confidence_gate_reason"}
+                 "confidence", "confidence_gate_reason", "verdict",
+                 "calibration_method", "raw_predictions"}
         # Collect numeric fields from all runs' prediction dicts
         field_values: Dict[str, List[float]] = {}
         for res in results:
@@ -921,6 +922,77 @@ async def _run_ensemble(
     merged["ensemble_runs_completed"] = completed
     merged["ensemble_runs_requested"] = ensemble_runs
     merged["ensemble_stats"] = ensemble_stats
+
+    # R1: Replace numeric prediction fields with ensemble medians
+    if numeric_distributions:
+        pred = merged.get("prediction")
+        if isinstance(pred, dict):
+            for field, dist in numeric_distributions.items():
+                if field.startswith("_"):
+                    continue
+                if isinstance(dist, dict) and "median" in dist and field in pred:
+                    if isinstance(pred[field], (int, float)):
+                        pred[field] = dist["median"]
+
+    # R2: Post-ensemble confidence gate — re-evaluate with ensemble-level stats
+    if completed >= 2:
+        try:
+            from ripple.primitives.prediction_quality import ConfidenceGate
+
+            gate = ConfidenceGate()
+            pred = merged.get("prediction", {})
+            raw_confidence = pred.get("confidence", "medium") if isinstance(pred, dict) else merged.get("confidence", "medium")
+
+            # Derive ensemble stability from numeric_distributions (worst level)
+            post_ensemble_stability = None
+            if numeric_distributions:
+                stability_levels = set()
+                for field, dist in numeric_distributions.items():
+                    if field.startswith("_"):
+                        continue
+                    if isinstance(dist, dict) and dist.get("stability"):
+                        stability_levels.add(dist["stability"])
+                if stability_levels:
+                    post_ensemble_stability = max(
+                        stability_levels,
+                        key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1),
+                    )
+
+            gate_result = gate.evaluate(
+                raw_confidence,
+                provider_available=False,  # no provider context in ensemble merge
+                ensemble_kappa=dimension_kappa,
+                ensemble_stability=post_ensemble_stability,
+                ensemble_agreement_rate=grade_agreement,
+            )
+            merged["confidence_gate"] = {
+                "gate_applied": gate_result.gate_applied,
+                "original_confidence": gate_result.original_confidence.value,
+                "final_confidence": gate_result.final_confidence.value,
+                "reason": gate_result.reason,
+                "factors": [
+                    {
+                        "name": f.name,
+                        "level": f.level.value,
+                        "reason": f.reason,
+                        "passed": f.passed,
+                    }
+                    for f in gate_result.factors
+                ],
+            }
+            # Also store in quality sub-dict for structured access (matches runtime.py convention)
+            merged.setdefault("quality", {})["confidence_gate_result"] = {
+                "original_confidence": gate_result.original_confidence.value,
+                "final_confidence": gate_result.final_confidence.value,
+                "gate_applied": gate_result.gate_applied,
+                "reason": gate_result.reason,
+            }
+            # Apply adjusted confidence to prediction
+            if isinstance(pred, dict) and gate_result.gate_applied:
+                pred["confidence"] = gate_result.final_confidence.value
+                pred["confidence_gate_reason"] = gate_result.reason
+        except Exception as exc:
+            logger.warning("Post-ensemble confidence gate failed (non-fatal): %s", exc)
 
     # Persist the aggregated view as the synthesis output (top-level keys)
     if recorder is not None:

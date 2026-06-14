@@ -90,3 +90,9 @@ Simulation errors return structured error in prediction:
 
 **Bad**: `from tests.backtest.fixtures.loader import ...` — breaks in production (tests/ not installed)
 **Good**: `from ripple.backtest.fixtures.loader import ...` — production path; test fixture re-exports for compat
+
+### Mistake: Storing enum/dataclass objects in result dict
+
+**Bad**: `result["confidence_gate"] = {"final_confidence": gate_result.final_confidence}` — stores `ConfidenceLevel` enum object; JSON serialization fails with `TypeError: Object of type ConfidenceLevel is not JSON serializable`
+**Good**: `result["confidence_gate"] = {"final_confidence": gate_result.final_confidence.value}` — stores string value; JSON-safe
+**Prevention**: Any value going into the result dict (which gets serialized by recorder and API) MUST be a JSON-safe type (str, int, float, bool, None, list, dict). Never store enum objects or dataclass instances directly.

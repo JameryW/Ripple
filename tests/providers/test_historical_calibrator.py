@@ -97,7 +97,9 @@ class TestHistoricalCalibrator:
     def test_within_threshold(self):
         historical = [{"views": 100}, {"views": 200}, {"views": 150}]
         report = self.calibrator.calibrate({"views": 160}, historical)
-        assert not report.has_actions
+        # No lower_confidence actions — deviation is within threshold
+        assert not any(a.action_type == "lower_confidence" for a in report.actions)
+        # May still have median_adjustment if predicted > median and <= P95
         assert all(cm.within_range for cm in report.calibrated_metrics)
 
     def test_deviation_exceeds_threshold(self):
@@ -156,6 +158,33 @@ class TestHistoricalCalibrator:
         historical = [{"views": 100}]
         report = self.calibrator.calibrate({}, historical)
         assert not report.has_actions
+
+    def test_median_adjustment_action_generated(self):
+        """When predicted is between median and P95, a median_adjustment action is generated."""
+        historical = [{"views": 100}, {"views": 200}, {"views": 300}, {"views": 400}, {"views": 500}]
+        report = self.calibrator.calibrate({"views": 350}, historical)
+        # 350 is between median(300) and P95(~500) — should get median_adjustment
+        action_types = [a.action_type for a in report.actions]
+        assert "median_adjustment" in action_types
+        adj = next(a for a in report.actions if a.action_type == "median_adjustment")
+        assert adj.metric == "views"
+        assert adj.original_value == 350.0
+        assert adj.calibrated_value is not None
+
+    def test_no_median_adjustment_when_predicted_below_median(self):
+        """When predicted <= median, no median_adjustment action."""
+        historical = [{"views": 100}, {"views": 200}, {"views": 300}, {"views": 400}, {"views": 500}]
+        report = self.calibrator.calibrate({"views": 200}, historical)
+        action_types = [a.action_type for a in report.actions]
+        assert "median_adjustment" not in action_types
+
+    def test_no_median_adjustment_when_predicted_above_p95(self):
+        """When predicted > P95, calibrated_prediction (not median_adjustment) is generated."""
+        historical = [{"views": 100}, {"views": 200}, {"views": 300}, {"views": 400}, {"views": 500}]
+        report = self.calibrator.calibrate({"views": 600}, historical)
+        action_types = [a.action_type for a in report.actions]
+        assert "median_adjustment" not in action_types
+        assert "calibrated_prediction" in action_types
 
 
 class TestCalibrationAction:

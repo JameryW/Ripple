@@ -23,7 +23,7 @@ def compute_numeric_metrics(
         all_errors.extend(r.errors)
 
     if not all_errors:
-        return {"mae": None, "mape": None, "rmse": None}
+        return {"mae": None, "mape": None, "signed_mape": None, "rmse": None}
 
     abs_errors = [e.absolute_error for e in all_errors]
     mae = sum(abs_errors) / len(abs_errors)
@@ -32,12 +32,17 @@ def compute_numeric_metrics(
     pct_errors = [e.percentage_error for e in all_errors if e.percentage_error is not None]
     mape = (sum(pct_errors) / len(pct_errors)) if pct_errors else None
 
+    # Signed symmetric MAPE: only over cases where (predicted+actual)/2 != 0
+    signed_pct = [e.signed_percentage_error for e in all_errors if e.signed_percentage_error is not None]
+    signed_mape = (sum(signed_pct) / len(signed_pct)) if signed_pct else None
+
     # RMSE
     rmse = math.sqrt(sum(e ** 2 for e in abs_errors) / len(abs_errors))
 
     return {
         "mae": round(mae, 4),
         "mape": round(mape, 4) if mape is not None else None,
+        "signed_mape": round(signed_mape, 4) if signed_mape is not None else None,
         "rmse": round(rmse, 4),
     }
 
@@ -109,7 +114,8 @@ def compute_prediction_errors(
 ) -> List[PredictionError]:
     """Compute per-field prediction errors."""
     _SKIP = {"step", "tick", "t", "phase", "agent_id", "id", "timestamp",
-             "confidence", "confidence_gate_reason", "verdict"}
+             "confidence", "confidence_gate_reason", "verdict",
+             "calibration_method", "raw_predictions"}
     errors: List[PredictionError] = []
 
     for key, pred_val in prediction.items():
@@ -125,6 +131,9 @@ def compute_prediction_errors(
         actual_f = float(actual_val)
         ae = abs(pred_f - actual_f)
         pe = (ae / abs(actual_f) * 100) if actual_f != 0 else None
+        # Symmetric signed percentage: (p-a)/((p+a)/2)*100
+        sym_denom = (pred_f + actual_f) / 2
+        spe = ((pred_f - actual_f) / sym_denom * 100) if sym_denom != 0 else None
 
         errors.append(PredictionError(
             metric=key,
@@ -132,6 +141,7 @@ def compute_prediction_errors(
             actual=actual_f,
             absolute_error=round(ae, 4),
             percentage_error=round(pe, 4) if pe is not None else None,
+            signed_percentage_error=round(spe, 4) if spe is not None else None,
         ))
 
     return errors

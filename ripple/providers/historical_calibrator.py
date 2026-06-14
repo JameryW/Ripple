@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class CalibrationAction:
     """A structured calibration action produced by the calibrator."""
-    action_type: str  # "lower_confidence" | "calibrated_prediction" | "flag_for_review"
+    action_type: str  # "lower_confidence" | "calibrated_prediction" | "median_adjustment" | "flag_for_review"
     metric: str
     reason: str
     original_value: Optional[float] = None
@@ -298,6 +298,17 @@ class HistoricalCalibrator:
                     reason=f"Predicted {predicted_value:.1f} exceeds P95 {baseline.p95:.1f}",
                     original_value=predicted_value,
                     calibrated_value=round(baseline.p95, 2),
+                    deviation_pct=round(dev_avg, 2),
+                ))
+
+            # Action: median < predicted <= P95 → median_adjustment
+            elif baseline.median is not None and baseline.p95 > 0 and predicted_value > baseline.median and predicted_value <= baseline.p95:
+                actions.append(CalibrationAction(
+                    action_type="median_adjustment",
+                    metric=metric_name,
+                    reason=f"Predicted {predicted_value:.1f} between median {baseline.median:.1f} and P95 {baseline.p95:.1f}",
+                    original_value=predicted_value,
+                    calibrated_value=round(baseline.median, 2),
                     deviation_pct=round(dev_avg, 2),
                 ))
 
