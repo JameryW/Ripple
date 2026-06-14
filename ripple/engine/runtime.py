@@ -154,6 +154,30 @@ def _empty_agent_stats() -> Dict[str, Any]:
     }
 
 
+def _safe_str_list(value: Any) -> List[str]:
+    """Coerce an audit field value to a list of strings.
+
+    Handles: list of strings, single string, None, or other types.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None and str(item).strip()]
+    return [str(value)]
+
+
+def _normalize_cap(value: Any) -> Optional[str]:
+    """Normalize a confidence cap value to 'low'|'medium'|'high' or None."""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in ("low", "medium", "high"):
+        return s
+    return None
+
+
 class SimulationRuntime:
     """Ripple 模拟运行时编排器。 / Ripple simulation runtime orchestrator."""
 
@@ -1219,6 +1243,22 @@ class SimulationRuntime:
                 pred["confidence_gate_reason"] = gate_result.reason
             result["confidence"] = gate_result.final_confidence.value
 
+            # R3/R4: Generate calibrated predictions from calibration report
+            self._apply_calibrated_predictions(result)
+
+        # Store confidence gate result in quality sub-dict for structured access
+        result.setdefault("quality", {})["confidence_gate_result"] = {
+            "original_confidence": gate_result.original_confidence.value,
+            "final_confidence": gate_result.final_confidence.value,
+            "gate_applied": gate_result.gate_applied,
+            "reason": gate_result.reason,
+        }
+
+        # R6: Parse tribunal audit fields from DELIBERATE phase output
+        tribunal_audit = self._parse_tribunal_audit()
+        if tribunal_audit is not None:
+            result["quality"]["tribunal_audit"] = tribunal_audit
+
         # R3: Mark as relative simulation when no real providers are available
         provider_factor = next((f for f in gate_result.factors if f.name == "provider_availability"), None)
         if provider_factor and not provider_factor.passed:
@@ -1257,6 +1297,10 @@ class SimulationRuntime:
             if insights:
                 self._recorder.record_process("providers", insights)
             self._recorder.record_process("quality_report", quality_report.to_dict())
+            # R2: Store evidence pack V2 in recorder for downstream consumers
+            if self._evidence_pack_v2 is not None:
+                from dataclasses import asdict as _asdict
+                self._recorder.record_process("evidence_pack", _asdict(self._evidence_pack_v2))
 
         logger.info(f"[{run_id}] 模拟完成: {effective_waves} waves, LLM 调用链结束")
         # Build quality detail for SSE event
@@ -1273,7 +1317,7 @@ class SimulationRuntime:
                 limit=160,
             ),
         }
-        # R8: quality fields in SSE
+        # R8: quality fields in SSE — confidence_gate_result
         if "confidence_gate" in result:
             cg = result["confidence_gate"]
             quality_detail["confidence_gate_result"] = {
@@ -1282,27 +1326,53 @@ class SimulationRuntime:
                 "gate_applied": cg.get("gate_applied"),
                 "reason": cg.get("reason"),
             }
+
+        # R8: evidence_balance — always include (zero counts when no evidence pack)
+        ev_balance: Dict[str, Any] = {
+            "positive_count": 0,
+            "negative_count": 0,
+            "silent_count": 0,
+            "balanced": True,
+        }
         if self._evidence_pack_v2 is not None:
             ep = self._evidence_pack_v2
-            quality_detail["evidence_balance"] = {
-                "positive": ep.positive_signals.count,
-                "negative": ep.negative_signals.count,
-                "silent": ep.silent_signals.count,
-                "cross_layer_depth": ep.cross_layer_depth,
+            pos = ep.positive_signals.count
+            neg = ep.negative_signals.count
+            silent = ep.silent_signals.count
+            ev_balance = {
+                "positive_count": pos,
+                "negative_count": neg,
+                "silent_count": silent,
+                "balanced": not (pos > 0 and neg == 0 and pos > 5) and not (silent > (pos + neg) and (pos + neg + silent) > 5),
             }
-        # Provider status summary
-        provider_status: Dict[str, str] = {}
+        quality_detail["evidence_balance"] = ev_balance
+        # Also store in result["quality"] for API consumers
+        result.setdefault("quality", {})["evidence_balance"] = ev_balance
+
+        # R8: provider_status — include even when no providers (available: False)
+        provider_status_detail: Dict[str, Any] = {"available": False, "categories": []}
         if self._providers is not None:
             from ripple.providers.registry import ProviderRegistry
             if isinstance(self._providers, ProviderRegistry):
+                available_categories: List[str] = []
+                cat_status: Dict[str, str] = {}
                 for cat in ("historical", "topology", "embedding", "ambient"):
                     try:
                         p = self._providers.get(cat)
-                        provider_status[cat] = "available" if p.is_available() else "stub"
+                        status = "available" if p.is_available() else "stub"
+                        cat_status[cat] = status
+                        if status == "available":
+                            available_categories.append(cat)
                     except Exception:
-                        provider_status[cat] = "error"
-        if provider_status:
-            quality_detail["provider_status"] = provider_status
+                        cat_status[cat] = "error"
+                provider_status_detail = {
+                    "available": len(available_categories) > 0,
+                    "categories": available_categories,
+                    "detail": cat_status,
+                }
+        quality_detail["provider_status"] = provider_status_detail
+        # Also store in result["quality"] for API consumers
+        result.setdefault("quality", {})["provider_status"] = provider_status_detail
 
         # R8: Full quality report in SSE event
         quality_detail["quality_report"] = result.get("quality_report", {})
@@ -1515,6 +1585,120 @@ class SimulationRuntime:
 
         return insights
 
+    def _parse_tribunal_audit(self) -> Optional[Dict[str, Any]]:
+        """R6: Robustly parse the 6 audit fields from DELIBERATE phase output.
+
+        Handles:
+        - Nested dict access (deliberation_summary.audit.field)
+        - Direct field access on DeliberationRecord
+        - Fallback to text extraction if structured fields are missing
+        - Default values when parsing fails
+
+        Returns a dict with the 6 R6 fields, or None when no DELIBERATE phase exists.
+        """
+        deliberate_output = self._extra_phase_outputs.get("DELIBERATE")
+        if not isinstance(deliberate_output, dict):
+            return None
+
+        # Path 1: Structured audit from deliberation_summary.audit
+        summary = deliberate_output.get("deliberation_summary")
+        if isinstance(summary, dict):
+            audit = summary.get("audit")
+            if isinstance(audit, dict):
+                return {
+                    "key_evidence": _safe_str_list(audit.get("key_evidence")),
+                    "uncertainties": _safe_str_list(audit.get("uncertainties")),
+                    "optimism_audit": _safe_str_list(audit.get("optimism_audit")),
+                    "overrated_dimensions": _safe_str_list(audit.get("overrated_dimensions")),
+                    "missing_evidence": _safe_str_list(audit.get("missing_evidence")),
+                    "recommended_confidence_cap": _normalize_cap(audit.get("recommended_confidence_cap")),
+                }
+
+        # Path 2: Audit extracted from DeliberationRecord in simulate.py handler
+        # The handler in simulate.py already puts audit fields into deliberation_summary
+        # if DeliberationRecord has them. Check for top-level audit fields in summary.
+        if isinstance(summary, dict):
+            # Check if summary has audit-like fields directly (flat structure)
+            has_audit_data = any(
+                isinstance(summary.get(k), list) and summary.get(k)
+                for k in ("key_evidence", "uncertainties", "optimism_audit",
+                          "overrated_dimensions", "missing_evidence")
+            )
+            if has_audit_data:
+                return {
+                    "key_evidence": _safe_str_list(summary.get("key_evidence")),
+                    "uncertainties": _safe_str_list(summary.get("uncertainties")),
+                    "optimism_audit": _safe_str_list(summary.get("optimism_audit")),
+                    "overrated_dimensions": _safe_str_list(summary.get("overrated_dimensions")),
+                    "missing_evidence": _safe_str_list(summary.get("missing_evidence")),
+                    "recommended_confidence_cap": _normalize_cap(summary.get("recommended_confidence_cap")),
+                }
+
+        # Path 3: Extract from raw deliberation_records (last round)
+        records = deliberate_output.get("deliberation_records", [])
+        if isinstance(records, list) and records:
+            last_record = records[-1]
+            if isinstance(last_record, dict):
+                has_audit_data = any(
+                    isinstance(last_record.get(k), list) and last_record.get(k)
+                    for k in ("key_evidence", "uncertainties", "optimism_audit",
+                              "overrated_dimensions", "missing_evidence")
+                )
+                if has_audit_data:
+                    return {
+                        "key_evidence": _safe_str_list(last_record.get("key_evidence")),
+                        "uncertainties": _safe_str_list(last_record.get("uncertainties")),
+                        "optimism_audit": _safe_str_list(last_record.get("optimism_audit")),
+                        "overrated_dimensions": _safe_str_list(last_record.get("overrated_dimensions")),
+                        "missing_evidence": _safe_str_list(last_record.get("missing_evidence")),
+                        "recommended_confidence_cap": _normalize_cap(last_record.get("recommended_confidence_cap")),
+                    }
+
+        # Path 4: Text extraction fallback — search narrative text for audit-like keywords
+        # This is a last resort for LLMs that don't output structured JSON
+        narratives: List[str] = []
+        if isinstance(summary, dict):
+            final_positions = summary.get("final_positions", [])
+            if isinstance(final_positions, list):
+                for pos in final_positions:
+                    if isinstance(pos, dict) and pos.get("narrative"):
+                        narratives.append(str(pos.get("narrative")))
+        if isinstance(records, list):
+            for rec in records:
+                if isinstance(rec, dict):
+                    for op in rec.get("opinions", []):
+                        if isinstance(op, dict) and op.get("narrative"):
+                            narratives.append(str(op.get("narrative")))
+
+        if narratives:
+            combined_text = " ".join(narratives)
+            # Simple keyword extraction for common audit signals
+            optimism_indicators = []
+            uncertainty_indicators = []
+            _OPTIMISM_KEYWORDS = ("overly optimistic", "overestimate", "too high", "乐观",
+                                  "高估", "过于乐观", "overrated")
+            _UNCERTAINTY_KEYWORDS = ("uncertain", "unclear", "not sure", "不确定",
+                                     "缺乏证据", "insufficient evidence")
+            for kw in _OPTIMISM_KEYWORDS:
+                if kw.lower() in combined_text.lower():
+                    optimism_indicators.append(f"Detected optimism signal: {kw}")
+            for kw in _UNCERTAINTY_KEYWORDS:
+                if kw.lower() in combined_text.lower():
+                    uncertainty_indicators.append(f"Detected uncertainty signal: {kw}")
+
+            if optimism_indicators or uncertainty_indicators:
+                return {
+                    "key_evidence": [],
+                    "uncertainties": uncertainty_indicators,
+                    "optimism_audit": optimism_indicators,
+                    "overrated_dimensions": [],
+                    "missing_evidence": [],
+                    "recommended_confidence_cap": None,
+                }
+
+        # No audit data found — return None (no DELIBERATE audit available)
+        return None
+
     def _evaluate_confidence_gate(
         self,
         result: Dict[str, Any],
@@ -1530,7 +1714,7 @@ class SimulationRuntime:
         5. Tribunal audit — recommended confidence cap from DELIBERATE phase
         6. Topology calibration — scale/type deviation from provider data
         """
-        from ripple.primitives.prediction_quality import ConfidenceGate, ConfidenceLevel
+        from ripple.primitives.prediction_quality import ConfidenceGate
 
         gate = ConfidenceGate()
 
@@ -1590,12 +1774,19 @@ class SimulationRuntime:
             silent_count = self._evidence_pack_v2.silent_signals.count
 
         # R6: Tribunal recommended confidence cap
+        # Primary path: from deliberation_summary.audit (populated by simulate.py handler)
         tribunal_cap = None
         deliberate_output = self._extra_phase_outputs.get("DELIBERATE", {})
         if isinstance(deliberate_output, dict):
             audit = (deliberate_output.get("deliberation_summary") or {}).get("audit")
             if isinstance(audit, dict):
                 tribunal_cap = audit.get("recommended_confidence_cap")
+
+        # Fallback: use _parse_tribunal_audit for more robust extraction
+        if tribunal_cap is None:
+            parsed_audit = self._parse_tribunal_audit()
+            if parsed_audit is not None:
+                tribunal_cap = parsed_audit.get("recommended_confidence_cap")
 
         # R3: Topology calibration from validation report
         topo_scale_ok = None
@@ -1619,6 +1810,94 @@ class SimulationRuntime:
             topology_scale_acceptable=topo_scale_ok,
             topology_type_acceptable=topo_type_ok,
         )
+
+    def _apply_calibrated_predictions(
+        self,
+        result: Dict[str, Any],
+    ) -> None:
+        """R3/R4: Generate calibrated predictions from HistoricalCalibrator report.
+
+        When the confidence gate fires AND a calibration report exists with
+        ``calibrated_prediction`` actions, this method:
+
+        1. Preserves the original LLM numeric fields in ``raw_predictions``.
+        2. Overwrites numeric prediction fields with historical percentile
+           baselines (P75 cap when predicted > P95, median adjustment otherwise).
+        3. Adds ``calibration_method`` explaining what was done.
+
+        The method is non-fatal — any exception is caught and logged.
+        """
+        if self._calibration_report is None:
+            return
+
+        pred = result.get("prediction")
+        if not isinstance(pred, dict):
+            return
+
+        try:
+            # Collect calibrated_prediction actions: metric -> calibrated_value
+            calibrations: Dict[str, Dict[str, Any]] = {}
+            for action in self._calibration_report.actions:
+                if action.action_type == "calibrated_prediction" and action.calibrated_value is not None:
+                    calibrations[action.metric] = {
+                        "calibrated_value": action.calibrated_value,
+                        "original_value": action.original_value,
+                        "deviation_pct": action.deviation_pct,
+                    }
+
+            if not calibrations:
+                return
+
+            # Determine calibration method from the worst action
+            methods: List[str] = []
+            for action in self._calibration_report.actions:
+                if action.action_type == "calibrated_prediction":
+                    methods.append("historical_p95_cap")
+                    break
+            if not methods:
+                methods.append("historical_median_adjustment")
+
+            calibration_method = methods[0]
+
+            # For metrics with calibrated_prediction actions, also check
+            # if they have a PercentileBaseline in calibrated_metrics
+            for cm in self._calibration_report.calibrated_metrics:
+                if cm.metric in calibrations and cm.baseline is not None:
+                    # If predicted > P95, use P75 as the cap (more conservative)
+                    # Otherwise, use the calibrated value (P95 cap from the action)
+                    if cm.predicted > cm.baseline.p95:
+                        calibrations[cm.metric]["calibrated_value"] = round(cm.baseline.p75, 2)
+                        calibration_method = "historical_p75_cap"
+                    elif cm.predicted > cm.baseline.median:
+                        calibrations[cm.metric]["calibrated_value"] = round(cm.baseline.median, 2)
+                        calibration_method = "historical_median_adjustment"
+
+            # Preserve original predictions
+            raw_predictions: Dict[str, Any] = {}
+            for metric in calibrations:
+                if metric in pred and isinstance(pred[metric], (int, float)):
+                    raw_predictions[metric] = pred[metric]
+
+            if not raw_predictions:
+                return
+
+            # Apply calibrated values
+            for metric, cal_info in calibrations.items():
+                if metric in raw_predictions:
+                    pred[metric] = cal_info["calibrated_value"]
+
+            # Store raw predictions and method for transparency
+            pred["raw_predictions"] = raw_predictions
+            pred["calibration_method"] = calibration_method
+
+            logger.info(
+                "Applied calibrated predictions: %s (method=%s)",
+                list(calibrations.keys()),
+                calibration_method,
+            )
+
+        except Exception as exc:
+            logger.warning("Calibrated prediction application failed (non-fatal): %s", exc)
 
     def _serialize_validation(self, report: Any) -> Dict[str, Any]:
         """Serialize a validation report into the provider_insights schema.

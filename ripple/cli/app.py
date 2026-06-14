@@ -137,6 +137,20 @@ app.add_typer(llm_app, name="llm")
 app.add_typer(domain_app, name="domain")
 app.add_typer(job_app, name="job")
 
+# ── Backtest sub-command ──────────────────────────────────────────────────
+backtest_app = typer.Typer(
+    cls=ChineseHelpGroup,
+    no_args_is_help=True,
+    context_settings=_HELP_CONTEXT_SETTINGS,
+    help="运行离线回测，用种子数据校准预测质量阈值。",
+    epilog=(
+        "示例：\n"
+        "  ripple-cli backtest run\n"
+        "  ripple-cli backtest run --json"
+    ),
+)
+app.add_typer(backtest_app, name="backtest")
+
 
 JsonOption = Annotated[
     bool,
@@ -3754,7 +3768,7 @@ def doctor(
         quality_checks: Dict[str, Any] = {}
         try:
             from ripple.primitives.prediction_quality import (
-                ConfidenceGate, ConfidenceLevel, normalize_confidence,
+                ConfidenceGate, ConfidenceLevel,
                 parse_prediction_contract, PredictionContract,
             )
             from ripple.providers.historical_calibrator import HistoricalCalibrator
@@ -3781,7 +3795,7 @@ def doctor(
 
             # Test historical calibrator
             calibrator = HistoricalCalibrator()
-            report = calibrator.calibrate({"views": 1000}, [{"views": 500, "views": 1500}])
+            report = calibrator.calibrate({"views": 1000}, [{"views": 500}, {"views": 1500}])
             quality_checks["historical_calibrator"] = {
                 "ok": report is not None,
             }
@@ -4987,6 +5001,131 @@ def worker(
         )
     except CLIError:
         raise typer.Exit(0)
+
+
+# ── Backtest commands ─────────────────────────────────────────────────────
+
+@backtest_app.command("run", help="Run backtest on seed fixture data and print results.")
+def backtest_run(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="以 JSON 输出到标准输出。"),
+    ] = False,
+) -> None:
+    """Run backtest on built-in seed fixtures and print a summary report.
+
+    This command loads synthetic test cases from the test fixtures directory,
+    generates biased predictions (optimistic/conservative/calibrated), and
+    runs the backtest runner to compute error metrics.  Useful for developers
+    to manually verify calibration thresholds.
+    """
+    import asyncio as _asyncio
+    from ripple.backtest.schema import BacktestCase
+    from ripple.backtest.runner import run_backtest as _run_backtest
+
+    from ripple.backtest.fixtures.loader import load_seed_cases_with_predictions
+
+    cases_with_preds = load_seed_cases_with_predictions()
+
+    # Build modified cases with case_id injected into simulation_input
+    cases: list = []
+    predictions_by_id: dict = {}
+    for case, pred in cases_with_preds:
+        modified_input = dict(case.simulation_input)
+        modified_input["_backtest_case_id"] = case.case_id
+        modified_case = BacktestCase(
+            case_id=case.case_id,
+            schema_version=case.schema_version,
+            skill_id=case.skill_id,
+            simulation_input=modified_input,
+            ground_truth=case.ground_truth,
+            platform=case.platform,
+            channel=case.channel,
+            vertical=case.vertical,
+            time_window=case.time_window,
+            content_type=case.content_type,
+            tags=case.tags,
+        )
+        cases.append(modified_case)
+        predictions_by_id[case.case_id] = pred
+
+    async def _mock_simulate(simulation_input: dict) -> dict:
+        case_id = simulation_input.get("_backtest_case_id", "")
+        prediction = predictions_by_id.get(case_id, {})
+        return {
+            "prediction": prediction,
+            "confidence": prediction.get("confidence", "medium"),
+        }
+
+    report = _asyncio.run(_run_backtest(cases, _mock_simulate))
+
+    if json_output:
+        result = {
+            "total_cases": report.total_cases,
+            "completed_cases": report.completed_cases,
+            "failed_cases": report.failed_cases,
+            "mae": report.mae,
+            "mape": report.mape,
+            "rmse": report.rmse,
+            "brier_score": report.brier_score,
+            "macro_f1": report.macro_f1,
+            "confidence_calibration": report.confidence_calibration,
+            "buckets": report.buckets,
+            "per_case": [
+                {
+                    "case_id": r.case_id,
+                    "predicted_confidence": r.predicted_confidence,
+                    "actual_accuracy": r.actual_accuracy,
+                    "error_count": len(r.errors),
+                    "error_message": r.error_message,
+                }
+                for r in report.results
+            ],
+        }
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        console.print(Rule("Backtest Seed Fixture Report"))
+        console.print(f"Total cases:    {report.total_cases}")
+        console.print(f"Completed:      {report.completed_cases}")
+        console.print(f"Failed:         {report.failed_cases}")
+        console.print(f"MAE:            {report.mae}")
+        console.print(f"MAPE:           {report.mape}%")
+        console.print(f"RMSE:           {report.rmse}")
+        console.print(f"Brier score:    {report.brier_score}")
+        console.print(f"Macro F1:       {report.macro_f1}")
+        console.print(f"Conf. calib.:   {report.confidence_calibration}")
+
+        table = Table(title="Per-Case Results")
+        table.add_column("Case ID", style="cyan")
+        table.add_column("Bias", style="magenta")
+        table.add_column("Avg MAPE", style="green")
+        table.add_column("Confidence", style="yellow")
+        for r in report.results:
+            bias_tag = ""
+            for case, _ in cases_with_preds:
+                if case.case_id == r.case_id:
+                    bias_tag = next(
+                        (t for t in case.tags if t in ("optimistic", "conservative", "calibrated")),
+                        "",
+                    )
+                    break
+            mape_vals = [e.percentage_error for e in r.errors if e.percentage_error is not None]
+            avg_mape = f"{sum(mape_vals) / len(mape_vals):.1f}%" if mape_vals else "N/A"
+            table.add_row(r.case_id, bias_tag, avg_mape, r.predicted_confidence)
+        console.print(table)
+
+        if report.buckets:
+            btable = Table(title="Bucket Breakdowns")
+            btable.add_column("Bucket", style="cyan")
+            btable.add_column("Count", style="green")
+            btable.add_column("MAPE", style="yellow")
+            for bucket_key, bucket_data in sorted(report.buckets.items()):
+                btable.add_row(
+                    bucket_key,
+                    str(bucket_data.get("count", 0)),
+                    f"{bucket_data.get('mape', 'N/A')}%" if bucket_data.get("mape") is not None else "N/A",
+                )
+            console.print(btable)
 
 
 def main() -> None:

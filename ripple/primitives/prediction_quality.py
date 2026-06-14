@@ -466,7 +466,7 @@ class ConfidenceGate:
         ensemble_stability: Optional[str] = None,
         ensemble_agreement_rate: Optional[float] = None,
         historical_max_deviation_pct: Optional[float] = None,
-        historical_threshold_pct: float = 100.0,
+        historical_threshold_pct: float = 50.0,
         evidence_positive_count: int = 0,
         evidence_negative_count: int = 0,
         evidence_silent_count: int = 0,

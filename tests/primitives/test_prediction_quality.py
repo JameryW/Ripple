@@ -306,6 +306,23 @@ class TestConfidenceGate:
         r = self.gate.evaluate("high", topology_scale_acceptable=True, topology_type_acceptable=True)
         assert not r.gate_applied
 
+    def test_default_threshold_triggers_at_50pct(self):
+        """Calibrated default threshold: 50% deviation triggers MEDIUM gate."""
+        r = self.gate.evaluate("high", historical_max_deviation_pct=60.0)
+        assert r.final_confidence == ConfidenceLevel.MEDIUM
+        assert r.gate_applied
+
+    def test_default_threshold_double_triggers_low(self):
+        """100% deviation (>2x the 50% default threshold) triggers LOW gate."""
+        r = self.gate.evaluate("high", historical_max_deviation_pct=120.0)
+        assert r.final_confidence == ConfidenceLevel.LOW
+        assert r.gate_applied
+
+    def test_default_threshold_within_passes(self):
+        """40% deviation is within the 50% default threshold, no gate."""
+        r = self.gate.evaluate("high", historical_max_deviation_pct=40.0)
+        assert not r.gate_applied
+
 
 # ---------------------------------------------------------------------------
 # R1: PredictionContract Parser

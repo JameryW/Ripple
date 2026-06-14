@@ -718,6 +718,48 @@ If any factor produces a level lower than original, `gate_applied = True` and `r
 - `self._extra_phase_outputs["DELIBERATE"]` → tribunal_confidence_cap
 - `self._validation_reports["topology"]` → scale/type acceptable
 
+### Default Threshold: 50%
+
+`historical_threshold_pct` defaults to **50.0** (not 100.0). The original 100% threshold was too lenient — predictions had to deviate by 2× the historical average before the gate triggered. Backtest fixtures show well-calibrated predictions have ~11% deviation while optimistic bias has ~235% deviation; 50% cleanly separates the two populations.
+
+### Confidence Gate Calibration (Rewrites Prediction Values)
+
+When `gate_result.gate_applied == True` AND `self._calibration_report` has `calibrated_prediction` actions, `_apply_calibrated_predictions()` rewrites prediction values:
+
+```python
+def _apply_calibrated_predictions(self, result: Dict[str, Any]) -> None:
+    """R3/R4: Apply calibrated predictions when confidence gate fires."""
+```
+
+**Behavior**:
+- Original LLM predictions preserved in `result["prediction"]["raw_predictions"]`
+- Numeric fields exceeding P95 replaced with P75 baseline from calibrator
+- Numeric fields between median and P95 replaced with median baseline
+- `calibration_method` field added: `"historical_p75_cap"` or `"historical_median_adjustment"`
+- Non-numeric fields untouched
+- Exceptions are caught and logged (non-fatal)
+
+**Output contract**:
+
+```json
+{
+  "prediction": {
+    "impressions": 1200,
+    "raw_predictions": {"impressions": 5000},
+    "calibration_method": "historical_p75_cap"
+  }
+}
+```
+
+### Gate Result Storage
+
+Confidence gate result is stored in two locations (backward compat):
+
+| Key | Location | Format |
+|-----|----------|--------|
+| `result["confidence_gate"]` | Top-level | String (final confidence level) |
+| `result["quality"]["confidence_gate_result"]` | Quality sub-dict | Full `ConfidenceGateResult` serialization |
+
 ### Gotcha: tribunal_divergence data flow
 
 `build_quality_report()` does NOT read `result["deliberation_summary"]` — that key doesn't exist at the top level of the result dict. The actual data lives in `runtime._extra_phase_outputs["DELIBERATE"]`. The runtime must explicitly extract and pass `deliberation_summary` to `build_quality_report()`.
@@ -761,6 +803,158 @@ def parse_prediction_contract(
 - High confidence predictions auto-receive evidence_ids from EvidencePackV2 (up to 3)
 - Result written to `result["prediction_contract"]` — never overwrites `result["prediction"]`
 - Quantile fields searched as `{field}_p50`, `{field}_p80`, `{field}_p95`
+
+---
+
+## Tribunal Audit Parsing (R6)
+
+> Robust extraction of 6 audit fields from Tribunal/DELIBERATE output.
+
+### 6 Required Audit Fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `key_evidence` | `List[str]` | Evidence IDs supporting the prediction |
+| `uncertainties` | `List[str]` | Key uncertainties in the prediction |
+| `optimism_audit` | `str` | Narrative assessment of optimistic bias |
+| `overrated_dimensions` | `List[str]` | Dimensions likely overrated |
+| `missing_evidence` | `List[str]` | Evidence gaps that would strengthen prediction |
+| `recommended_confidence_cap` | `str \| None` | Tribunal's recommended max confidence level |
+
+### 4-Path Parsing Strategy
+
+`_parse_tribunal_audit()` extracts audit fields through 4 paths of decreasing specificity:
+
+| Priority | Path | Source |
+|----------|------|--------|
+| 1 | Structured audit | `deliberation_summary.audit.<field>` |
+| 2 | Flat summary fields | `deliberation_summary.<field>` (no `audit` wrapper) |
+| 3 | DeliberationRecord | `self._extra_phase_outputs["DELIBERATE"].deliberation_records[].<field>` |
+| 4 | Text keyword fallback | Regex scan of narrative text for optimism/uncertainty keywords |
+
+**Key rule**: Each path fills only fields not already found by a higher-priority path. If all paths fail, fields default to `None` (not empty lists).
+
+### Tribunal Prompt Instructions
+
+`TribunalAgent.evaluate` and `TribunalAgent.revise` prompts now include structured audit instructions requiring the LLM to output an `audit` section with the 6 fields. `_extract_audit_from_llm_data()` parses the audit from each agent's response and stores it in `_last_audit`.
+
+### Audit Aggregation in DeliberationOrchestrator
+
+`_aggregate_audit_from_agents()` collects audit fields from all tribunal agents:
+- `key_evidence`, `uncertainties`, `overrated_dimensions`, `missing_evidence` → union of all agents' lists
+- `optimism_audit` → concatenated narratives
+- `recommended_confidence_cap` → **most conservative** (lowest) value across agents
+
+### Output Storage
+
+Parsed audit stored in `result["quality"]["tribunal_audit"]`:
+
+```json
+{
+  "quality": {
+    "tribunal_audit": {
+      "key_evidence": ["ev_001", "ev_003"],
+      "uncertainties": ["Platform algorithm changes"],
+      "optimism_audit": "Prediction assumes viral sharing...",
+      "overrated_dimensions": ["reach"],
+      "missing_evidence": ["Historical conversion data"],
+      "recommended_confidence_cap": "medium"
+    }
+  }
+}
+```
+
+### Gotcha: `_safe_str_list` duplication
+
+`_safe_str_list` is defined in both `tribunal.py` and `runtime.py` with identical logic. This is intentional (each module is independently importable) but must be kept in sync.
+
+---
+
+## SSE Quality Fields (R3/R5/R6)
+
+> Quality fields pushed in SYNTHESIZE `phase_end` SSE events and stored in `result["quality"]`.
+
+### SSE Event Detail Contract
+
+SYNTHESIZE `phase_end` event `detail` dict always includes three quality fields:
+
+```json
+{
+  "confidence_gate_result": {
+    "original_confidence": "high",
+    "final_confidence": "medium",
+    "gate_applied": true,
+    "reason": "provider_availability: No provider data; historical_deviation: Deviation 65.0% > threshold 50.0%"
+  },
+  "evidence_balance": {
+    "positive_count": 5,
+    "negative_count": 2,
+    "silent_count": 1,
+    "balanced": true
+  },
+  "provider_status": {
+    "available": false,
+    "categories": [],
+    "detail": {}
+  }
+}
+```
+
+### Field Rules
+
+| Field | Always Present? | When Missing |
+|-------|----------------|--------------|
+| `confidence_gate_result` | Yes | Defaults to `{"final_confidence": "medium", "gate_applied": false}` |
+| `evidence_balance` | Yes | Zero counts + `balanced: true` when no evidence pack |
+| `provider_status` | Yes | `available: false`, empty categories when no providers |
+
+### API Consumer Access
+
+Same data also available via `result["quality"]` dict after simulation completes:
+
+```python
+result["quality"]["evidence_balance"]  # same structure as SSE detail
+result["quality"]["provider_status"]   # same structure as SSE detail
+result["quality"]["confidence_gate_result"]  # full gate result
+result["quality"]["tribunal_audit"]    # parsed audit fields
+```
+
+---
+
+## Backtest Seed Fixtures & CLI (R7)
+
+> Offline backtesting infrastructure with versioned cases and CLI runner.
+
+### Fixture Location
+
+Production fixture loader: `ripple/backtest/fixtures/loader.py`
+Test re-export: `tests/backtest/fixtures/loader.py` (imports from production path)
+
+### Seed Case Schema
+
+8 synthetic-but-realistic cases in `ripple/backtest/fixtures/seed_cases.yaml`:
+
+| Case | Bias Type | Platform | MAPE Range |
+|------|-----------|----------|------------|
+| 1-3 | Optimistic (3-4× overprediction) | Xiaohongshu, Weibo | ~235% |
+| 4-5 | Conservative (0.3-0.4× underprediction) | Xiaohongshu | ~64% |
+| 6-8 | Well-calibrated (0.85-1.2×) | Weibo, Xiaohongshu | ~11% |
+
+### CLI Command
+
+```bash
+ripple-cli backtest run           # Human-readable summary table
+ripple-cli backtest run --json    # JSON output
+```
+
+### Calibration Threshold Rationale
+
+Backtest fixtures validated the 50% threshold:
+- Well-calibrated predictions: ~11% deviation → gate NOT triggered
+- Optimistic bias predictions: ~235% deviation → gate triggered
+- Conservative bias predictions: ~64% deviation → gate triggered
+
+The 50% default cleanly separates calibrated from biased predictions without false-positive gating on reasonable predictions.
 
 ---
 
