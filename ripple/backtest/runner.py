@@ -28,6 +28,9 @@ async def run_backtest(
     simulate_fn: Callable[..., Awaitable[Dict[str, Any]]],
     *,
     accuracy_threshold_pct: float = 50.0,
+    params_snapshot: Optional[Dict[str, float]] = None,
+    simulate_kwargs: Optional[Dict[str, Any]] = None,
+    persist: bool = False,
 ) -> BacktestReport:
     """Run backtest on a list of cases.
 
@@ -35,18 +38,24 @@ async def run_backtest(
         cases: Backtest cases with ground truth (NOT passed to simulate).
         simulate_fn: Async callable that takes simulation_input and returns result.
         accuracy_threshold_pct: Threshold for marking a prediction as "accurate".
+        params_snapshot: Tunable parameter values used for this run.
+        simulate_kwargs: Extra keyword arguments passed to simulate_fn on each call.
+        persist: If True, save report to BacktestStore after completion.
 
     Returns:
         BacktestReport with aggregated metrics.
     """
     report = BacktestReport(total_cases=len(cases))
+    if params_snapshot:
+        report.params_snapshot = dict(params_snapshot)
     results: List[BacktestResult] = []
+    extra_kwargs = simulate_kwargs or {}
 
     for case in cases:
         # Run simulation with ONLY prediction-time input (no ground truth)
         start = time.monotonic()
         try:
-            result = await simulate_fn(case.simulation_input)
+            result = await simulate_fn(case.simulation_input, **extra_kwargs)
             elapsed = time.monotonic() - start
 
             # Extract prediction
@@ -110,17 +119,16 @@ async def run_backtest(
     report.brier_score = compute_brier_score(results)
 
     # Per-bucket breakdowns
-    buckets: Dict[str, Dict[str, List[BacktestResult]]] = {}
-    for case, result in zip(cases, results):
+    buckets: Dict[str, List[BacktestResult]] = {}
+    for case, bt_res in zip(cases, results):
         for bucket_field in ("platform", "channel", "vertical", "skill_id",
                              "model", "prompt_hash", "skill_version"):
             val = getattr(case, bucket_field, "")
             if val:
                 key = f"{bucket_field}={val}"
-                buckets.setdefault(key, {}).setdefault("results", []).append(result)
+                buckets.setdefault(key, []).append(bt_res)
 
-    for bucket_key, bucket_data in buckets.items():
-        bucket_results = bucket_data.get("results", [])
+    for bucket_key, bucket_results in buckets.items():
         bucket_numeric = compute_numeric_metrics(bucket_results)
         bucket_grade = compute_grade_metrics(bucket_results)
         report.buckets[bucket_key] = {
@@ -133,11 +141,19 @@ async def run_backtest(
         }
 
     logger.info(
-        "Backtest complete: %d/%d cases, MAE=%s, MAPE=%s",
+        "Backtest complete: %d/%d cases, MAE=%s, MAPE=%s, run_id=%s",
         report.completed_cases,
         report.total_cases,
         report.mae,
         report.mape,
+        report.run_id,
     )
+
+    if persist:
+        try:
+            from ripple.backtest.store import BacktestStore
+            BacktestStore().save(report)
+        except Exception as exc:
+            logger.warning("Failed to persist backtest report: %s", exc)
 
     return report

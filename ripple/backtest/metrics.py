@@ -9,7 +9,7 @@ Confidence calibration: accuracy per confidence level
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ripple.backtest.schema import BacktestResult, PredictionError, GradeError
 
@@ -162,7 +162,6 @@ def compute_brier_score(
     squared_errors: List[float] = []
 
     for r in results:
-        pred = r.prediction if isinstance(r.prediction, dict) else {}
         # Find case's ground truth via errors — but we need actual outcome
         # Instead, use the case's stored ground truth indirectly:
         # each PredictionError gives us predicted & actual

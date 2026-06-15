@@ -1,9 +1,8 @@
 # tests/backtest/test_backtest.py
 """Tests for offline backtesting framework — R7."""
 
-import pytest
 
-from ripple.backtest.schema import BacktestCase, BacktestResult, BacktestReport, PredictionError
+from ripple.backtest.schema import BacktestCase, BacktestResult, PredictionError
 from ripple.backtest.metrics import (
     compute_numeric_metrics,
     compute_grade_metrics,

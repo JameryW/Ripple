@@ -14,12 +14,13 @@ This directory contains guidelines for backend development. Fill in each file wi
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
+| [Directory Structure](./directory-structure.md) | Module organization and file layout | Active |
+| [Database Guidelines](./database-guidelines.md) | SQLite patterns, BacktestStore schema | Active |
 | [Error Handling](./error-handling.md) | Non-fatal quality gates, graceful fallback, provider error patterns | Active |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Provider Architecture](./provider-architecture.md) | DataSource Provider abstraction, ConfidenceGate, Calibration, Tribunal Audit, SSE Quality, Backtest | Active |
+| [Backtest Feedback Loop](./backtest-feedback-loop.md) | Store → Analyzer → Optimizer → Validator contracts, CLI commands, data flow | Active |
 
 ---
 
