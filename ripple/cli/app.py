@@ -5082,6 +5082,12 @@ def backtest_run(
             "macro_f1": report.macro_f1,
             "confidence_calibration": report.confidence_calibration,
             "buckets": report.buckets,
+            "ensemble_stability": report.ensemble_stability,
+            "tribunal_divergence": report.tribunal_divergence,
+            "evidence_balance": report.evidence_balance,
+            "input_completeness": report.input_completeness,
+            "historical_deviation": report.historical_deviation,
+            "residual_risks": report.residual_risks,
             "per_case": [
                 {
                     "case_id": r.case_id,
@@ -5108,6 +5114,19 @@ def backtest_run(
         console.print(f"Brier score:    {report.brier_score}")
         console.print(f"Macro F1:       {report.macro_f1}")
         console.print(f"Conf. calib.:   {report.confidence_calibration}")
+
+        # Quality dimensions
+        quality_parts = []
+        if report.ensemble_stability:
+            quality_parts.append(f"stability={report.ensemble_stability}")
+        if report.tribunal_divergence:
+            quality_parts.append(f"divergence={report.tribunal_divergence}")
+        if report.input_completeness is not None:
+            quality_parts.append(f"completeness={report.input_completeness:.0%}")
+        if report.historical_deviation is not None:
+            quality_parts.append(f"deviation={report.historical_deviation:.1f}%")
+        if quality_parts:
+            console.print(f"Quality:        {'  '.join(quality_parts)}")
 
         table = Table(title="Per-Case Results")
         table.add_column("Case ID", style="cyan")
@@ -5376,15 +5395,28 @@ def backtest_history(
         table.add_column("Cases", style="magenta")
         table.add_column("MAPE", style="yellow")
         table.add_column("Signed MAPE", style="red")
+        table.add_column("Quality", style="blue")
         for r in runs:
             mape_str = f"{r['mape']:.1f}%" if r.get("mape") is not None else "N/A"
             smape_str = f"{r['signed_mape']:.1f}%" if r.get("signed_mape") is not None else "N/A"
+            # Build quality summary from new fields
+            quality_parts = []
+            if r.get("ensemble_stability"):
+                quality_parts.append(f"stability={r['ensemble_stability']}")
+            if r.get("tribunal_divergence"):
+                quality_parts.append(f"divergence={r['tribunal_divergence']}")
+            if r.get("input_completeness") is not None:
+                quality_parts.append(f"completeness={r['input_completeness']:.0%}")
+            if r.get("historical_deviation") is not None:
+                quality_parts.append(f"deviation={r['historical_deviation']:.1f}%")
+            quality_str = "  ".join(quality_parts) if quality_parts else "-"
             table.add_row(
                 r["run_id"],
                 r["timestamp"][:19],
                 f"{r['completed_cases']}/{r['total_cases']}",
                 mape_str,
                 smape_str,
+                quality_str,
             )
         console.print(table)
 

@@ -121,6 +121,11 @@ class TestListRuns:
         assert "params_snapshot" in r
         # Full report_json should NOT be in summary
         assert "report_json" not in r
+        # Quality dimension fields are extracted from report_json
+        assert "ensemble_stability" in r
+        assert "tribunal_divergence" in r
+        assert "input_completeness" in r
+        assert "historical_deviation" in r
 
 
 class TestQueryRecent:

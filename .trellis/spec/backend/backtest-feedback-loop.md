@@ -47,6 +47,13 @@ ABValidator(degradation_threshold: float = 0.10)
 | `run_id` | `str` | UUID4, set by runner |
 | `timestamp` | `str` | ISO format, set by runner |
 | `params_snapshot` | `dict` | Tunable params at run time |
+| `ensemble_stability` | `str or None` | Worst stability across cases ("high"/"medium"/"low") |
+| `tribunal_divergence` | `str or None` | Worst divergence across cases ("high"/"medium"/"low") |
+| `evidence_balance` | `dict[str, int]` | Aggregated {"positive": N, "negative": N, "silent": N} |
+| `input_completeness` | `float or None` | Mean completeness across cases (0.0-1.0) |
+| `historical_deviation` | `float or None` | Max historical deviation pct |
+| `residual_risks` | `list[str]` | Deduplicated risk warnings |
+| `quality_report_dict` | `dict or None` | Raw quality_report dump for future fields |
 
 #### DeviationReport
 
@@ -102,6 +109,7 @@ ABValidator(degradation_threshold: float = 0.10)
 | `test_analyzer.py` | Over/under/neutral bias detection, min_runs enforcement, per-metric breakdown |
 | `test_optimizer.py` | Over-predict → lower thresholds, under-predict → higher thresholds, neutral → defaults, custom grid |
 | `test_validator.py` | No-degradation passes, degradation triggers rollback, rollback returns old params, custom threshold |
+| `test_backtest.py` | Quality signal extraction, aggregation, backward compatibility, graceful defaults |
 
 ### 7. Wrong vs Correct
 
@@ -159,14 +167,15 @@ ripple backtest run --persist --auto-optimize
 
 ```
 run --persist
-  → BacktestReport (with run_id, timestamp, params_snapshot)
+  → simulate_fn per case → extract quality signals (ensemble_stability, tribunal_divergence, etc.)
+  → BacktestReport (with run_id, timestamp, params_snapshot, quality dimensions)
   → BacktestStore.save()
 
 optimize
   → BacktestStore.query_recent()
   → DeviationAnalyzer.analyze() → DeviationReport
   → ParameterOptimizer.optimize() → OptimizationResult
-  → run_backtest(proposed_params) → trial BacktestReport
+  → run_backtest(proposed_params) → trial BacktestReport (with quality dimensions)
   → ABValidator.validate(baseline, trial) → ValidationResult
   → if not passed: ABValidator.rollback() → previous params
 ```

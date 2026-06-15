@@ -361,6 +361,96 @@ class TestBacktestRunnerIntegration:
 
         assert isinstance(report.confidence_calibration, dict)
 
+    @pytest.mark.asyncio
+    async def test_report_has_quality_fields(self, cases_with_predictions):
+        """Verify that BacktestReport has quality dimension fields (may be None for mock simulate)."""
+        cases = []
+        predictions_by_id = {}
+        for case, pred in cases_with_predictions:
+            modified_input = dict(case.simulation_input)
+            modified_input["_backtest_case_id"] = case.case_id
+            modified_case = BacktestCase(
+                case_id=case.case_id,
+                schema_version=case.schema_version,
+                skill_id=case.skill_id,
+                simulation_input=modified_input,
+                ground_truth=case.ground_truth,
+                platform=case.platform,
+                channel=case.channel,
+                vertical=case.vertical,
+                time_window=case.time_window,
+                content_type=case.content_type,
+                tags=case.tags,
+            )
+            cases.append(modified_case)
+            predictions_by_id[case.case_id] = pred
+
+        mock_fn = _make_mock_simulate(predictions_by_id)
+        report = await run_backtest(cases, mock_fn)
+
+        # Quality fields exist (may be None/empty for mock simulate_fn)
+        assert hasattr(report, "ensemble_stability")
+        assert hasattr(report, "tribunal_divergence")
+        assert hasattr(report, "evidence_balance")
+        assert hasattr(report, "input_completeness")
+        assert hasattr(report, "historical_deviation")
+        assert hasattr(report, "residual_risks")
+        assert hasattr(report, "quality_report_dict")
+        # input_completeness is computed from simulation_input, should have a value
+        assert report.input_completeness is not None
+        assert isinstance(report.input_completeness, float)
+
+    @pytest.mark.asyncio
+    async def test_quality_signals_from_rich_simulate(self, cases_with_predictions):
+        """Verify quality fields are populated when simulate_fn returns quality signals."""
+        cases = []
+        predictions_by_id = {}
+        for case, pred in cases_with_predictions:
+            modified_input = dict(case.simulation_input)
+            modified_input["_backtest_case_id"] = case.case_id
+            modified_case = BacktestCase(
+                case_id=case.case_id,
+                schema_version=case.schema_version,
+                skill_id=case.skill_id,
+                simulation_input=modified_input,
+                ground_truth=case.ground_truth,
+                platform=case.platform,
+                channel=case.channel,
+                vertical=case.vertical,
+                time_window=case.time_window,
+                content_type=case.content_type,
+                tags=case.tags,
+            )
+            cases.append(modified_case)
+            predictions_by_id[case.case_id] = pred
+
+        async def _rich_mock_simulate(simulation_input: Dict[str, Any]) -> Dict[str, Any]:
+            case_id = simulation_input.get("_backtest_case_id", "")
+            prediction = predictions_by_id.get(case_id, {})
+            return {
+                "prediction": prediction,
+                "confidence": prediction.get("confidence", "medium"),
+                "ensemble_stats": {
+                    "dimension_aggregates": {
+                        "reach_realism": {"stability": "high", "score": 0.9},
+                    },
+                },
+                "deliberation_summary": {
+                    "dissent_points": ["decay_realism"],
+                    "consensus_points": ["reach_realism", "virality_plausibility"],
+                },
+                "evidence_balance": {"positive": 4, "negative": 1},
+                "calibration_report": {"max_deviation": 22.5},
+            }
+
+        report = await run_backtest(cases, _rich_mock_simulate)
+
+        # Quality fields should be populated from the rich simulate result
+        assert report.ensemble_stability == "high"
+        assert report.tribunal_divergence == "medium"  # 1 dissent / 3 total = 33% >= 25%
+        assert report.evidence_balance != {}
+        assert report.historical_deviation is not None
+
 
 class TestBacktestSummaryReport:
     """Print a human-readable summary for manual review (not an assertion test)."""

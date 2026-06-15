@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
 
 
 def _row_to_summary(row: sqlite3.Row) -> Dict[str, Any]:
-    return {
+    summary: Dict[str, Any] = {
         "run_id": row["run_id"],
         "timestamp": row["timestamp"],
         "mape": row["mape"],
@@ -56,6 +56,16 @@ def _row_to_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "failed_cases": row["failed_cases"],
         "params_snapshot": json.loads(row["params_snapshot"]),
     }
+    # Extract quality dimensions from report_json
+    try:
+        report_data = json.loads(row["report_json"])
+        summary["ensemble_stability"] = report_data.get("ensemble_stability")
+        summary["tribunal_divergence"] = report_data.get("tribunal_divergence")
+        summary["input_completeness"] = report_data.get("input_completeness")
+        summary["historical_deviation"] = report_data.get("historical_deviation")
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return summary
 
 
 class BacktestStore:
@@ -133,7 +143,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         rows = conn.execute(
             """\
 SELECT run_id, timestamp, mape, signed_mape, mae, rmse, macro_f1,
-       total_cases, completed_cases, failed_cases, params_snapshot
+       total_cases, completed_cases, failed_cases, params_snapshot, report_json
 FROM runs ORDER BY timestamp DESC LIMIT ?
 """,
             (limit,),
