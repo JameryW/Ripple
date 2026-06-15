@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
+- **Total Sessions**: 9
 - **Last Active**: 2026-06-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~276 | Active |
+| `journal-1.md` | ~309 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-06-15 | Backtest feedback loop full architecture | `3e4c506` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 8 | 2026-06-15 | Fix ensemble merging, stability direction, median adjustment reachability, signed MAPE | `4d82a16` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 7 | 2026-06-14 | Close prediction quality loop: calibration rewrites, tribunal audit, SSE fields, backtest fixtures | `1e38d94` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 6 | 2026-06-13 | Implement prediction quality framework R1-R8 | `b38c393`, `5bc79ed`, `c129ce9`, `06a63a5` | `feat/sse-wave-progress-and-api-runtime-fields` |

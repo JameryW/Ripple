@@ -274,3 +274,36 @@ Fixed 4 interrelated bugs: (1) ensemble merge now uses medians from numeric_dist
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: Backtest feedback loop full architecture
+
+**Date**: 2026-06-15
+**Task**: Backtest feedback loop full architecture
+**Branch**: `feat/sse-wave-progress-and-api-runtime-fields`
+
+### Summary
+
+Implemented full backtest feedback loop (Path C): SQLite persistence (BacktestStore), DeviationAnalyzer (bias detection via signed_mape), ParameterOptimizer (grid search on 3 threshold params, 64 candidates), ABValidator (A/B comparison with automatic rollback on >10% degradation). CLI: ripple backtest history, ripple backtest optimize. Updated code-specs for backtest feedback loop, database guidelines, directory structure. All 101 tests green, lint/typecheck clean.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3e4c506` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
