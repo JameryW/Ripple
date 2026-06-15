@@ -120,6 +120,15 @@ class BacktestReport:
     # Brier score for probabilistic predictions
     brier_score: Optional[float] = None
 
+    # Quality dimensions (from runtime QualityReport, when available)
+    ensemble_stability: Optional[str] = None  # "high"|"medium"|"low"|None
+    tribunal_divergence: Optional[str] = None  # "high"|"medium"|"low"|None
+    evidence_balance: Dict[str, int] = field(default_factory=dict)  # {"positive": N, "negative": N, "silent": N}
+    input_completeness: Optional[float] = None  # 0.0-1.0
+    historical_deviation: Optional[float] = None  # max deviation pct
+    residual_risks: List[str] = field(default_factory=list)
+    quality_report_dict: Optional[Dict[str, Any]] = None  # raw dump for future fields
+
     # Per-bucket breakdowns
     buckets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
