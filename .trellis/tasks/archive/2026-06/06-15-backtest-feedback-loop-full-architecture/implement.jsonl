@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "HistoricalCalibrator, ConfidenceGate, backtest metrics contracts — all new modules depend on these existing contracts"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Non-fatal pattern for optimizer/validator — new code must follow graceful fallback conventions"}
