@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Verify ConfidenceGate, Calibration, and Tribunal Audit contracts are respected by all fixes"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify new code paths (post-ensemble gate, median_adjustment handler) follow non-fatal fallback pattern"}

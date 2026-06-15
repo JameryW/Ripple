@@ -13,17 +13,14 @@ Also prints a human-readable summary for manual review.
 
 from __future__ import annotations
 
-import math
 from typing import Any, Awaitable, Callable, Dict, List
 
 import pytest
 
-from ripple.backtest.schema import BacktestCase, BacktestReport
+from ripple.backtest.schema import BacktestCase
 from ripple.backtest.runner import run_backtest
 from ripple.backtest.metrics import (
-    compute_numeric_metrics,
     compute_prediction_errors,
-    compute_brier_score,
 )
 from tests.backtest.fixtures.loader import (
     load_seed_cases,

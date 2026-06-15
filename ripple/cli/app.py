@@ -5011,6 +5011,14 @@ def backtest_run(
         bool,
         typer.Option("--json", help="以 JSON 输出到标准输出。"),
     ] = False,
+    persist: Annotated[
+        bool,
+        typer.Option("--persist", help="将回测结果持久化到本地 SQLite 存储。"),
+    ] = False,
+    auto_optimize: Annotated[
+        bool,
+        typer.Option("--auto-optimize", help="运行后自动触发参数优化（需配合 --persist）。"),
+    ] = False,
 ) -> None:
     """Run backtest on built-in seed fixtures and print a summary report.
 
@@ -5057,15 +5065,18 @@ def backtest_run(
             "confidence": prediction.get("confidence", "medium"),
         }
 
-    report = _asyncio.run(_run_backtest(cases, _mock_simulate))
+    report = _asyncio.run(_run_backtest(cases, _mock_simulate, persist=persist))
 
     if json_output:
         result = {
+            "run_id": report.run_id,
+            "timestamp": report.timestamp,
             "total_cases": report.total_cases,
             "completed_cases": report.completed_cases,
             "failed_cases": report.failed_cases,
             "mae": report.mae,
             "mape": report.mape,
+            "signed_mape": report.signed_mape,
             "rmse": report.rmse,
             "brier_score": report.brier_score,
             "macro_f1": report.macro_f1,
@@ -5085,11 +5096,14 @@ def backtest_run(
         typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         console.print(Rule("Backtest Seed Fixture Report"))
+        console.print(f"Run ID:         {report.run_id}")
+        console.print(f"Timestamp:      {report.timestamp}")
         console.print(f"Total cases:    {report.total_cases}")
         console.print(f"Completed:      {report.completed_cases}")
         console.print(f"Failed:         {report.failed_cases}")
         console.print(f"MAE:            {report.mae}")
         console.print(f"MAPE:           {report.mape}%")
+        console.print(f"Signed MAPE:    {report.signed_mape}%")
         console.print(f"RMSE:           {report.rmse}")
         console.print(f"Brier score:    {report.brier_score}")
         console.print(f"Macro F1:       {report.macro_f1}")
@@ -5126,6 +5140,253 @@ def backtest_run(
                     f"{bucket_data.get('mape', 'N/A')}%" if bucket_data.get("mape") is not None else "N/A",
                 )
             console.print(btable)
+
+    # Auto-optimize after run if requested
+    if auto_optimize and persist:
+        try:
+            from ripple.backtest.store import BacktestStore as _Store
+            from ripple.backtest.analyzer import DeviationAnalyzer as _Analyzer
+            from ripple.backtest.optimizer import ParameterOptimizer as _Optimizer, DEFAULT_PARAMS as _DEFAULTS
+            from ripple.backtest.validator import ABValidator as _Validator
+
+            _store = _Store()
+            _reports = _store.query_recent(n=5)
+            if len(_reports) >= 2:
+                _analyzer = _Analyzer(min_runs=2)
+                _deviation = _analyzer.analyze(_reports)
+                _current = _reports[0].params_snapshot if _reports[0].params_snapshot else dict(_DEFAULTS)
+                _optimizer = _Optimizer()
+                _opt = _optimizer.optimize(_deviation, current_params=_current)
+
+                _validator = _Validator()
+                _val = _asyncio.run(
+                    _validator.validate(cases, _mock_simulate, _current, _opt.proposed_params)
+                )
+                if _validator.should_rollback(_val):
+                    _validator.rollback(_current)
+                    _val.rolled_back = True
+                    console.print("[red]Auto-optimize: ROLLBACK triggered. Restored previous params.[/red]")
+                elif _val.passed:
+                    console.print(f"[green]Auto-optimize: Validation passed. Proposed params: {_opt.proposed_params}[/green]")
+                else:
+                    console.print(f"[yellow]Auto-optimize: Validation did not pass. Degraded: {', '.join(_val.degraded_metrics)}[/yellow]")
+            else:
+                console.print("[yellow]Auto-optimize: Need at least 2 persisted runs. Run `backtest run --persist` again.[/yellow]")
+        except Exception as exc:
+            console.print(f"[yellow]Auto-optimize failed: {exc}[/yellow]")
+    elif auto_optimize and not persist:
+        console.print("[yellow]Auto-optimize requires --persist to build history. Skipping optimization.[/yellow]")
+
+
+@backtest_app.command("optimize", help="Analyze backtest history and propose optimized parameters.")
+def backtest_optimize(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="以 JSON 输出到标准输出。"),
+    ] = False,
+    recent_n: Annotated[
+        int,
+        typer.Option("--recent", "-n", help="分析最近 N 次运行记录。"),
+    ] = 5,
+) -> None:
+    """Read recent backtest history, compute bias, propose new params, and A/B validate.
+
+    This command:
+    1. Loads recent persisted backtest reports from the SQLite store.
+    2. Runs DeviationAnalyzer to detect systematic bias.
+    3. Runs ParameterOptimizer to propose corrective parameters.
+    4. Runs A/B validation (backtest with old vs new params).
+    5. If validation passes, shows proposed params; if fails, shows rollback message.
+    """
+    import asyncio as _asyncio
+    from ripple.backtest.store import BacktestStore
+    from ripple.backtest.analyzer import DeviationAnalyzer
+    from ripple.backtest.optimizer import ParameterOptimizer, DEFAULT_PARAMS
+    from ripple.backtest.validator import ABValidator
+    from ripple.backtest.schema import BacktestCase
+    from ripple.backtest.fixtures.loader import load_seed_cases_with_predictions
+
+    store = BacktestStore()
+    try:
+        reports = store.query_recent(n=recent_n)
+    except Exception as exc:
+        typer.echo(f"Error reading backtest history: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if not reports:
+        typer.echo("No backtest runs found. Run `ripple-cli backtest run --persist` first.")
+        return
+
+    # Step 1: Analyze deviation
+    analyzer = DeviationAnalyzer(min_runs=2)
+    deviation_report = analyzer.analyze(reports)
+
+    # Step 2: Optimize parameters
+    # Use the most recent run's params as current baseline
+    current_params = reports[0].params_snapshot if reports[0].params_snapshot else dict(DEFAULT_PARAMS)
+    optimizer = ParameterOptimizer()
+    opt_result = optimizer.optimize(deviation_report, current_params=current_params)
+
+    # Step 3: A/B validation
+    cases_with_preds = load_seed_cases_with_predictions()
+    cases: list = []
+    predictions_by_id: dict = {}
+    for case, pred in cases_with_preds:
+        modified_input = dict(case.simulation_input)
+        modified_input["_backtest_case_id"] = case.case_id
+        modified_case = BacktestCase(
+            case_id=case.case_id,
+            schema_version=case.schema_version,
+            skill_id=case.skill_id,
+            simulation_input=modified_input,
+            ground_truth=case.ground_truth,
+            platform=case.platform,
+            channel=case.channel,
+            vertical=case.vertical,
+            time_window=case.time_window,
+            content_type=case.content_type,
+            tags=case.tags,
+        )
+        cases.append(modified_case)
+        predictions_by_id[case.case_id] = pred
+
+    async def _mock_simulate(simulation_input: dict) -> dict:
+        case_id = simulation_input.get("_backtest_case_id", "")
+        prediction = predictions_by_id.get(case_id, {})
+        return {
+            "prediction": prediction,
+            "confidence": prediction.get("confidence", "medium"),
+        }
+
+    validator = ABValidator()
+    val_result = _asyncio.run(
+        validator.validate(cases, _mock_simulate, current_params, opt_result.proposed_params)
+    )
+
+    # Step 4: Handle rollback if needed
+    if validator.should_rollback(val_result):
+        restored = validator.rollback(current_params)
+        val_result.rolled_back = True
+        val_result.warnings.append("Rollback triggered: restored previous parameter snapshot.")
+
+    # Output
+    if json_output:
+        output = {
+            "deviation_report": {
+                "overall_bias": deviation_report.overall_bias,
+                "overall_signed_mape": deviation_report.overall_signed_mape,
+                "sample_count": deviation_report.sample_count,
+                "per_metric": [
+                    {
+                        "metric": m.metric,
+                        "bias_direction": m.bias_direction,
+                        "magnitude": m.magnitude,
+                        "signed_mape": m.signed_mape,
+                    }
+                    for m in deviation_report.per_metric
+                ],
+            },
+            "optimization_result": {
+                "proposed_params": opt_result.proposed_params,
+                "score": opt_result.score,
+                "improvement_estimate": opt_result.improvement_estimate,
+                "current_params": opt_result.current_params,
+                "bias_direction": opt_result.bias_direction,
+                "candidates_evaluated": opt_result.candidates_evaluated,
+            },
+            "validation_result": {
+                "passed": val_result.passed,
+                "old_mape": val_result.old_mape,
+                "new_mape": val_result.new_mape,
+                "mape_change_pct": val_result.mape_change_pct,
+                "degraded_metrics": val_result.degraded_metrics,
+                "rolled_back": val_result.rolled_back,
+            },
+        }
+        typer.echo(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        console.print(Rule("Backtest Parameter Optimization"))
+        console.print(f"Analyzed runs:      {deviation_report.sample_count}")
+        console.print(f"Overall bias:        {deviation_report.overall_bias}")
+        console.print(f"Overall signed MAPE: {deviation_report.overall_signed_mape:.1f}%")
+
+        if deviation_report.per_metric:
+            table = Table(title="Per-Metric Bias")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Direction", style="magenta")
+            table.add_column("Magnitude", style="green")
+            table.add_column("Signed MAPE", style="yellow")
+            for m in deviation_report.per_metric:
+                table.add_row(m.metric, m.bias_direction, f"{m.magnitude:.1f}", f"{m.signed_mape:.1f}%")
+            console.print(table)
+
+        console.print()
+        console.print(Rule("Optimization Result"))
+        console.print(f"Current params:    {opt_result.current_params}")
+        console.print(f"Proposed params:   {opt_result.proposed_params}")
+        console.print(f"Score:             {opt_result.score:.4f}")
+        console.print(f"Est. improvement:  {opt_result.improvement_estimate:.1f}%")
+        console.print(f"Candidates tried:  {opt_result.candidates_evaluated}")
+
+        console.print()
+        console.print(Rule("A/B Validation"))
+        console.print(f"Passed:            {val_result.passed}")
+        console.print(f"Old MAPE:          {val_result.old_mape}")
+        console.print(f"New MAPE:          {val_result.new_mape}")
+        console.print(f"MAPE change:       {val_result.mape_change_pct:.1f}%" if val_result.mape_change_pct is not None else "MAPE change:       N/A")
+        if val_result.degraded_metrics:
+            console.print(f"[red]Degraded metrics:  {', '.join(val_result.degraded_metrics)}[/red]")
+        if val_result.rolled_back:
+            console.print("[red]ROLLBACK: Restored previous parameter snapshot.[/red]")
+        elif val_result.passed:
+            console.print("[green]Validation passed. Proposed parameters are safe to apply.[/green]")
+
+
+@backtest_app.command("history", help="List persisted backtest run history.")
+def backtest_history(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="显示最近 N 条记录。"),
+    ] = 20,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="以 JSON 输出到标准输出。"),
+    ] = False,
+) -> None:
+    """List recent backtest runs from the local SQLite store."""
+    from ripple.backtest.store import BacktestStore
+
+    store = BacktestStore()
+    try:
+        runs = store.list_runs(limit=limit)
+    except Exception as exc:
+        typer.echo(f"Error reading backtest history: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if not runs:
+        typer.echo("No backtest runs found. Run `ripple-cli backtest run --persist` first.")
+        return
+
+    if json_output:
+        typer.echo(json.dumps(runs, ensure_ascii=False, indent=2))
+    else:
+        table = Table(title="Backtest Run History")
+        table.add_column("Run ID", style="cyan")
+        table.add_column("Timestamp", style="green")
+        table.add_column("Cases", style="magenta")
+        table.add_column("MAPE", style="yellow")
+        table.add_column("Signed MAPE", style="red")
+        for r in runs:
+            mape_str = f"{r['mape']:.1f}%" if r.get("mape") is not None else "N/A"
+            smape_str = f"{r['signed_mape']:.1f}%" if r.get("signed_mape") is not None else "N/A"
+            table.add_row(
+                r["run_id"],
+                r["timestamp"][:19],
+                f"{r['completed_cases']}/{r['total_cases']}",
+                mape_str,
+                smape_str,
+            )
+        console.print(table)
 
 
 def main() -> None:

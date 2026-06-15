@@ -115,7 +115,7 @@ def _build_report_inner(
                     if sl:
                         levels.add(sl)
             if levels:
-                ensemble_stability = min(levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))
+                ensemble_stability = max(levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))
 
     # 5. Tribunal divergence
     tribunal_divergence = None

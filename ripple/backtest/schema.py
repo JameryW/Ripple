@@ -8,7 +8,9 @@ when generating predictions.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -65,6 +67,7 @@ class PredictionError:
     actual: float
     absolute_error: float
     percentage_error: Optional[float] = None  # None when actual == 0
+    signed_percentage_error: Optional[float] = None  # symmetric signed MAPE term; None when predicted+actual == 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,10 @@ class BacktestResult:
 @dataclass
 class BacktestReport:
     """Aggregated backtest report across multiple cases."""
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    params_snapshot: Dict[str, float] = field(default_factory=dict)  # tunable params used during this run
+
     schema_version: str = SCHEMA_VERSION
     total_cases: int = 0
     completed_cases: int = 0
@@ -100,6 +107,7 @@ class BacktestReport:
     # Numeric metrics (aggregated across all cases)
     mae: Optional[float] = None  # Mean Absolute Error
     mape: Optional[float] = None  # Mean Absolute Percentage Error
+    signed_mape: Optional[float] = None  # Symmetric signed MAPE (positive=over-predict, negative=under-predict)
     rmse: Optional[float] = None  # Root Mean Square Error
 
     # Grade metrics
@@ -117,3 +125,31 @@ class BacktestReport:
 
     # Per-case results
     results: List[BacktestResult] = field(default_factory=list)
+
+
+@dataclass
+class OptimizationResult:
+    """Result of parameter optimization based on deviation analysis."""
+    proposed_params: Dict[str, float] = field(default_factory=dict)
+    score: float = 0.0  # Lower is better (represents expected deviation after applying params)
+    improvement_estimate: float = 0.0  # Estimated % improvement in signed_mape
+    current_params: Dict[str, float] = field(default_factory=dict)
+    bias_direction: str = "neutral"  # "over_predict" | "under_predict" | "neutral"
+    candidates_evaluated: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationResult:
+    """Result of A/B validation comparing old vs new parameter sets."""
+    old_params: Dict[str, float] = field(default_factory=dict)
+    new_params: Dict[str, float] = field(default_factory=dict)
+    old_mape: Optional[float] = None
+    new_mape: Optional[float] = None
+    old_signed_mape: Optional[float] = None
+    new_signed_mape: Optional[float] = None
+    mape_change_pct: Optional[float] = None  # % change in MAPE (negative = improvement)
+    passed: bool = True  # True if new params don't degrade any metric > 10%
+    degraded_metrics: List[str] = field(default_factory=list)  # Metrics that degraded > 10%
+    rolled_back: bool = False  # True if rollback was triggered
+    warnings: List[str] = field(default_factory=list)

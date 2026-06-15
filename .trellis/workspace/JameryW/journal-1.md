@@ -241,3 +241,36 @@ Implemented 5 gaps to close the prediction quality loop: (1) ConfidenceGate rewr
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: Fix ensemble merging, stability direction, median adjustment reachability, signed MAPE
+
+**Date**: 2026-06-15
+**Task**: Fix ensemble merging, stability direction, median adjustment reachability, signed MAPE
+**Branch**: `feat/sse-wave-progress-and-api-runtime-fields`
+
+### Summary
+
+Fixed 4 interrelated bugs: (1) ensemble merge now uses medians from numeric_distributions + post-ensemble confidence gate, (2) stability direction fixed min→max so worst level is selected, (3) median_adjustment action type added for median<predicted<=P95 case, (4) signed_mape (symmetric signed MAPE) added to backtest metrics. trellis-check found 9 additional issues (BacktestReport schema gap, JSON serialization bug, _SKIP set gaps) — all fixed. 762 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4d82a16` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

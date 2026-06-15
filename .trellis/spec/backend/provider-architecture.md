@@ -614,6 +614,7 @@ class HistoricalCalibrator:
 |-------------|---------|--------|
 | `lower_confidence` | Deviation > threshold or > p95_hard_cap | `confidence_cap` set to "medium" or "low" |
 | `calibrated_prediction` | Predicted > P95 | `calibrated_value` = P95 value |
+| `median_adjustment` | Median < Predicted <= P95 | `calibrated_value` = median value |
 | `flag_for_review` | Predicted > 2×P95 | Flagged for human review |
 
 ### CalibrationReport Contract
@@ -621,7 +622,7 @@ class HistoricalCalibrator:
 ```json
 {
   "calibrated_metrics": [{"metric": "impressions", "predicted": 5000, "baseline": {...}, "deviation_from_avg_pct": 354.5, "actions": [...]}],
-  "actions": [{"action_type": "lower_confidence", "metric": "impressions", "reason": "...", "confidence_cap": "low"}],
+  "actions": [{"action_type": "median_adjustment", "metric": "engagement", "reason": "Predicted 550.0 between median 450.0 and P95 650.0", "original_value": 550.0, "calibrated_value": 450.0}],
   "bucket_key": "platform=xiaohongshu,channel=generic",
   "warnings": []
 }
@@ -633,21 +634,6 @@ class HistoricalCalibrator:
 - Calibration actions injected into `provider_insights["historical"]["calibration"]`
 - `CalibrationReport` stored on `self._calibration_report` for quality report consumption
 
-### PercentileBaseline
-
-```python
-@dataclass(frozen=True)
-class PercentileBaseline:
-    metric: str
-    count: int
-    avg: float
-    median: float   # P50
-    p75: float
-    p90: float
-    p95: float
-    max_val: float
-```
-
 ### Key Rules
 
 | Rule | Behavior |
@@ -657,10 +643,17 @@ class PercentileBaseline:
 | `bucket_context` is None | Uses all records (bucket_key = "default") |
 | Prediction has no numeric fields | Empty `calibrated_metrics`, no actions |
 | Calibrator exception | Returns None (non-fatal), logged by caller |
+| `median_adjustment` action | Produced when `median < predicted <= P95`; `calibrated_value` = median |
+| `calibrated_prediction` action | Produced when `predicted > P95`; `calibrated_value` = P95 |
 
-### Gotcha: _extract_numeric_fields is duplicated
+### _apply_calibrated_predictions Behavior
 
-`historical_validator.py` and `historical_calibrator.py` both define `_extract_numeric_fields` with identical logic. This is intentional (each module is independently importable) but must be kept in sync if the skip-list changes.
+Processes both `calibrated_prediction` and `median_adjustment` actions:
+- For `calibrated_prediction` with `PercentileBaseline`: if `predicted > P95`, upgrade cap to P75 (more conservative)
+- For `median_adjustment`: applies median value directly (calibrator already set `calibrated_value`)
+- Original values preserved in `result["prediction"]["raw_predictions"]`
+- `calibration_method` = most severe action type present: `"historical_p95_cap"` > `"historical_p75_cap"` > `"historical_median_adjustment"`
+- Non-fatal: exceptions caught and logged
 
 ---
 
@@ -718,38 +711,15 @@ If any factor produces a level lower than original, `gate_applied = True` and `r
 - `self._extra_phase_outputs["DELIBERATE"]` → tribunal_confidence_cap
 - `self._validation_reports["topology"]` → scale/type acceptable
 
-### Default Threshold: 50%
+**Stability direction**: `ensemble_stability` picks the WORST (lowest) stability level across dimensions using `max(levels, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x, 1))`. When dimensions have mixed high/low stability, the result is "low" (not "high").
 
-`historical_threshold_pct` defaults to **50.0** (not 100.0). The original 100% threshold was too lenient — predictions had to deviate by 2× the historical average before the gate triggered. Backtest fixtures show well-calibrated predictions have ~11% deviation while optimistic bias has ~235% deviation; 50% cleanly separates the two populations.
+### Post-Ensemble Confidence Gate
 
-### Confidence Gate Calibration (Rewrites Prediction Values)
-
-When `gate_result.gate_applied == True` AND `self._calibration_report` has `calibrated_prediction` actions, `_apply_calibrated_predictions()` rewrites prediction values:
-
-```python
-def _apply_calibrated_predictions(self, result: Dict[str, Any]) -> None:
-    """R3/R4: Apply calibrated predictions when confidence gate fires."""
-```
-
-**Behavior**:
-- Original LLM predictions preserved in `result["prediction"]["raw_predictions"]`
-- Numeric fields exceeding P95 replaced with P75 baseline from calibrator
-- Numeric fields between median and P95 replaced with median baseline
-- `calibration_method` field added: `"historical_p75_cap"` or `"historical_median_adjustment"`
-- Non-numeric fields untouched
-- Exceptions are caught and logged (non-fatal)
-
-**Output contract**:
-
-```json
-{
-  "prediction": {
-    "impressions": 1200,
-    "raw_predictions": {"impressions": 5000},
-    "calibration_method": "historical_p75_cap"
-  }
-}
-```
+When `ensemble_runs >= 2`, `_run_ensemble` in `simulate.py` runs a second confidence gate pass after merging:
+- Uses ensemble-level `dimension_kappa`, `post_ensemble_stability` (derived from `numeric_distributions`), and `grade_agreement`
+- Result stored in `merged["confidence_gate"]` AND `merged["quality"]["confidence_gate_result"]`
+- If gate fires, prediction confidence is lowered to `gate_result.final_confidence.value`
+- Non-fatal: exception caught, logged, gate skipped
 
 ### Gate Result Storage
 
@@ -757,12 +727,10 @@ Confidence gate result is stored in two locations (backward compat):
 
 | Key | Location | Format |
 |-----|----------|--------|
-| `result["confidence_gate"]` | Top-level | String (final confidence level) |
-| `result["quality"]["confidence_gate_result"]` | Quality sub-dict | Full `ConfidenceGateResult` serialization |
+| `result["confidence_gate"]` | Top-level | Dict with `gate_applied`, `original_confidence` (str), `final_confidence` (str), `reason`, `factors` (list of dicts) |
+| `result["quality"]["confidence_gate_result"]` | Quality sub-dict | Same dict |
 
-### Gotcha: tribunal_divergence data flow
-
-`build_quality_report()` does NOT read `result["deliberation_summary"]` — that key doesn't exist at the top level of the result dict. The actual data lives in `runtime._extra_phase_outputs["DELIBERATE"]`. The runtime must explicitly extract and pass `deliberation_summary` to `build_quality_report()`.
+**Serialization rule**: `ConfidenceLevel` enums and `ConfidenceFactor` dataclasses MUST be serialized to strings/dicts before storing in result dict. Using `.value` for enums and explicit dict construction for factors. JSON recorder and API responses serialize to JSON; raw enum/dataclass objects cause `TypeError`.
 
 ---
 
@@ -955,6 +923,61 @@ Backtest fixtures validated the 50% threshold:
 - Conservative bias predictions: ~64% deviation → gate triggered
 
 The 50% default cleanly separates calibrated from biased predictions without false-positive gating on reasonable predictions.
+
+### Numeric Metrics Contract
+
+```python
+class PredictionError:
+    metric: str
+    predicted: float
+    actual: float
+    absolute_error: float
+    percentage_error: Optional[float] = None        # None when actual == 0
+    signed_percentage_error: Optional[float] = None  # symmetric signed: (p-a)/((p+a)/2)*100; None when p+a == 0
+```
+
+`compute_numeric_metrics()` returns:
+
+| Key | Formula | Direction |
+|-----|---------|-----------|
+| `mae` | `mean(abs_error)` | Always positive |
+| `mape` | `mean(abs_error / abs(actual) * 100)` | Always positive |
+| `signed_mape` | `mean((predicted - actual) / ((predicted + actual) / 2) * 100)` | Positive = over-predict, Negative = under-predict |
+| `rmse` | `sqrt(mean(abs_error^2))` | Always positive |
+
+`signed_mape` uses symmetric denominator to handle near-zero actuals better than standard MAPE. The sign distinguishes systematic over-prediction (positive) from under-prediction (negative).
+
+`BacktestReport` schema includes `signed_mape: Optional[float] = None`. Runner populates it from `compute_numeric_metrics` output (both top-level and per-bucket breakdowns).
+
+---
+
+## Ensemble Merge & Post-Ensemble Gate (R1/R2)
+
+> When `ensemble_runs >= 2`, `_run_ensemble` in `simulate.py` merges results using ensemble medians and re-runs the confidence gate.
+
+### Merge Behavior
+
+After all ensemble runs complete, `_run_ensemble`:
+1. **Median replacement**: For each numeric field in `numeric_distributions`, replaces `merged["prediction"][field]` with the ensemble median
+2. **Post-ensemble gate**: Runs `ConfidenceGate.evaluate()` with ensemble-level stats:
+   - `ensemble_kappa` = Fleiss' kappa from `dimension_agreement_kappa`
+   - `ensemble_stability` = worst stability level from `numeric_distributions[*].stability`
+   - `ensemble_agreement_rate` = `grade_agreement`
+3. **Gate result storage**: Stored in `merged["confidence_gate"]` and `merged["quality"]["confidence_gate_result"]`
+4. **Confidence application**: If gate fires, `merged["prediction"]["confidence"]` lowered to `gate_result.final_confidence.value`
+
+### Key Rules
+
+| Rule | Behavior |
+|------|----------|
+| `ensemble_runs == 1` | No post-ensemble gate; median replacement is no-op (no numeric_distributions) |
+| No numeric fields across runs | No median replacement; gate still runs with `post_ensemble_stability = None` |
+| Gate exception | `logger.warning`, gate skipped, simulation continues |
+| `_SKIP` fields in `_aggregate_numeric_predictions` | `step`, `tick`, `t`, `phase`, `agent_id`, `id`, `timestamp`, `confidence`, `confidence_gate_reason`, `verdict`, `calibration_method`, `raw_predictions` |
+
+### Gotcha: `_run_ensemble` does NOT re-run calibration
+
+The post-ensemble gate uses `provider_available=False` because `_run_ensemble` has no access to provider context. Full calibration still only runs per-run inside `SimulationRuntime._run_phases`.
 
 ---
 
