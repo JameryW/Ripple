@@ -1796,6 +1796,22 @@ class SimulationRuntime:
             topo_scale_ok = getattr(getattr(topo_report, "scale", None), "is_acceptable", None)
             topo_type_ok = getattr(getattr(topo_report, "type_dist", None), "is_acceptable", None)
 
+        # Calibration feedback: adjust historical_threshold_pct from backtest feedback
+        hist_threshold_pct = 50.0  # default
+        try:
+            from ripple.runtime_paths import resolve_output_dir
+            from ripple.backtest.calibration_feedback import get_adjusted_threshold
+            from pathlib import Path
+            data_dir = Path(resolve_output_dir())
+            hist_threshold_pct = get_adjusted_threshold(data_dir, default=50.0)
+            if hist_threshold_pct != 50.0:
+                logger.info(
+                    "Using calibration-adjusted historical_threshold_pct=%.1f (default=50.0)",
+                    hist_threshold_pct,
+                )
+        except Exception:
+            pass  # Non-fatal: use default threshold
+
         return gate.evaluate(
             raw_confidence,
             provider_available=provider_available,
@@ -1803,6 +1819,7 @@ class SimulationRuntime:
             ensemble_stability=ensemble_stability,
             ensemble_agreement_rate=agreement_rate,
             historical_max_deviation_pct=hist_max_dev,
+            historical_threshold_pct=hist_threshold_pct,
             evidence_positive_count=pos_count,
             evidence_negative_count=neg_count,
             evidence_silent_count=silent_count,
