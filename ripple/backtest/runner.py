@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Awaitable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Awaitable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from ripple.backtest.calibration_feedback import CalibrationFeedbackConfig
 
 from ripple.backtest.schema import BacktestCase, BacktestResult, BacktestReport
 from ripple.backtest.metrics import (
@@ -227,6 +230,7 @@ async def run_backtest(
     params_snapshot: Optional[Dict[str, float]] = None,
     simulate_kwargs: Optional[Dict[str, Any]] = None,
     persist: bool = False,
+    calibration_feedback_config: Optional[CalibrationFeedbackConfig] = None,
 ) -> BacktestReport:
     """Run backtest on a list of cases.
 
@@ -237,6 +241,9 @@ async def run_backtest(
         params_snapshot: Tunable parameter values used for this run.
         simulate_kwargs: Extra keyword arguments passed to simulate_fn on each call.
         persist: If True, save report to BacktestStore after completion.
+        calibration_feedback_config: CalibrationFeedbackConfig for closed-loop feedback.
+            If provided and enabled, bias patterns are extracted and calibration
+            adjustments are applied after the report is built.
 
     Returns:
         BacktestReport with aggregated metrics.
@@ -360,6 +367,24 @@ async def run_backtest(
         report.mape,
         report.run_id,
     )
+
+    # 校准反馈闭环：提取偏差模式并调整阈值
+    if calibration_feedback_config is not None:
+        try:
+            from ripple.backtest.calibration_feedback import (
+                apply_feedback,
+                CalibrationDataStore,
+            )
+            store = CalibrationDataStore()
+            adjustments = apply_feedback(report, store, calibration_feedback_config)
+            if adjustments:
+                logger.info(
+                    "校准反馈闭环: run_id=%s 产生 %d 项阈值调整",
+                    report.run_id,
+                    len(adjustments),
+                )
+        except Exception as exc:
+            logger.warning("校准反馈闭环异常（非致命）: %s", exc)
 
     if persist:
         try:

@@ -133,6 +133,207 @@ if not validation.passed:
 
 ---
 
+## Scenario: Calibration Feedback Loop (Path B — Auto-Threshold)
+
+### 1. Scope / Trigger
+
+- Trigger: `run_backtest()` called with `calibration_feedback_config` parameter
+- Automatic: BacktestReport.signed_mape → BiasPattern → CalibrationDataStore → HistoricalCalibrator → ConfidenceGate
+- No CLI command needed; fires automatically when backtest runs with config enabled
+
+### 2. Signatures
+
+```python
+# Config
+@dataclass(frozen=True)
+class CalibrationFeedbackConfig:
+    enabled: bool = True
+    feedback_strength: float = 0.5       # [0.0, 1.0] — 0.0 = no adjustment, 1.0 = full adjustment
+    cooldown_period: int = 3              # minimum new backtest runs between adjustments
+    min_cases_for_adjustment: int = 5     # minimum backtest cases to trigger adjustment
+    bias_threshold_pct: float = 10.0      # |signed_mape| must exceed this to trigger
+
+# Data models
+@dataclass(frozen=True)
+class BiasPattern:
+    bucket_key: str       # "" for global, "platform=xiaohongshu" for per-bucket
+    signed_mape: float    # positive = over-predict, negative = under-predict
+    sample_size: int
+    timestamp: str        # ISO 8601
+    run_id: str
+
+@dataclass(frozen=True)
+class CalibrationAdjustment:
+    bucket_key: str
+    old_threshold_pct: float
+    new_threshold_pct: float
+    reason: str
+    timestamp: str
+    run_id: str
+    feedback_strength: float
+
+# Store
+CalibrationDataStore(data_dir: Path | None = None)
+  .save_bias_pattern(pattern: BiasPattern) -> None
+  .get_bias_patterns(bucket_key: str | None = None) -> List[BiasPattern]
+  .save_adjustment(adjustment: CalibrationAdjustment) -> None
+  .get_adjustments(bucket_key: str | None = None) -> List[CalibrationAdjustment]
+  .set_effective_threshold(bucket_key: str, threshold_pct: float) -> None
+  .get_effective_threshold(bucket_key: str, default: float | None = 50.0) -> float | None
+  .get_all_thresholds() -> Dict[str, float]
+
+# Core functions
+extract_bias_patterns(report: BacktestReport, config: CalibrationFeedbackConfig) -> List[BiasPattern]
+compute_threshold_adjustment(patterns: List[BiasPattern], store: CalibrationDataStore, config: CalibrationFeedbackConfig) -> List[CalibrationAdjustment]
+apply_feedback(report: BacktestReport, store: CalibrationDataStore, config: CalibrationFeedbackConfig | None = None) -> List[CalibrationAdjustment]
+get_calibrated_threshold(bucket_context: Dict[str, Any] | None = None, default: float = 50.0, store: CalibrationDataStore | None = None) -> float
+
+# Bridge function (in historical_calibrator.py)
+apply_calibration_feedback(bucket_context: Dict[str, Any] | None = None, default: float = 50.0, store: CalibrationDataStore | None = None) -> float
+```
+
+### 3. Contracts
+
+#### Storage Layout
+
+```
+~/.ripple/data/calibration/
+  bias_patterns.json     — append-only list of BiasPattern dicts
+  adjustments.json       — append-only list of CalibrationAdjustment dicts
+  thresholds.json        — current effective thresholds {bucket_key: float}
+```
+
+#### BiasPattern Extraction Rules
+
+| Source | Condition | Pattern Generated |
+|--------|-----------|-------------------|
+| `report.signed_mape` | `completed_cases >= min_cases_for_adjustment` AND `abs(signed_mape) >= bias_threshold_pct` | Global pattern (`bucket_key=""`) |
+| `report.buckets[key]` | `count >= min_cases_for_adjustment` AND `abs(signed_mape) >= bias_threshold_pct` | Per-bucket pattern (`bucket_key="platform=xiaohongshu"`) |
+
+#### Threshold Adjustment Formula
+
+```
+raw_adjustment = signed_mape * feedback_strength
+clamped_adjustment = clamp(raw_adjustment, -15, +15)  # max ±15% per adjustment
+new_threshold = clamp(current_threshold + clamped_adjustment, 10, 200)
+```
+
+Direction:
+- `signed_mape > 0` (over-prediction) → raise threshold → stricter gating
+- `signed_mape < 0` (under-prediction) → lower threshold → more permissive gating
+
+#### Cooldown Logic
+
+Check last `cooldown_period` adjustments for the bucket. If the current pattern's `run_id` appears in any of those adjustments, skip (prevents duplicate adjustments from the same backtest run). This does NOT permanently freeze buckets — old adjustments with different run_ids are allowed.
+
+> **Critical gotcha**: Previous implementation counted total adjustments and compared against `cooldown_period`, which permanently froze buckets once they accumulated enough adjustments. The correct logic only checks the most recent `cooldown_period` entries and only blocks same-run duplicates.
+
+#### Bucket Matching Priority (get_calibrated_threshold)
+
+1. Exact multi-field match: `"platform=xiaohongshu,channel=generic"`
+2. Single-field match: `"platform=xiaohongshu"` (first matching field)
+3. Global threshold: `bucket_key=""`
+4. Default: `50.0`
+
+#### Runtime Integration
+
+- `SimulationRuntime._calibrate_historical()`: calls `apply_calibration_feedback()` → stores result in `self._calibrated_historical_threshold`
+- `SimulationRuntime._evaluate_confidence_gate()`: passes `self._calibrated_historical_threshold` as `historical_threshold_pct` to `ConfidenceGate.evaluate()`
+- `SimulationRuntime.run()`: resets `_calibrated_historical_threshold = 50.0` at start (prevents threshold leaking across runs when runtime is reused)
+
+### 4. Validation & Error Matrix
+
+| Condition | Behavior |
+|-----------|----------|
+| `config.enabled = False` | `apply_feedback()` returns `[]`, no I/O |
+| `feedback_strength < 0` or `> 1` | `ValueError` in `__post_init__` |
+| `cooldown_period < 0` | `ValueError` in `__post_init__` |
+| `min_cases_for_adjustment < 0` | `ValueError` in `__post_init__` |
+| `bias_threshold_pct < 0` | `ValueError` in `__post_init__` |
+| No significant bias detected | Returns `[]`, no I/O |
+| Cooldown active (same run_id) | Skip adjustment, log info |
+| Store file corrupted | `logger.warning`, return empty list |
+| Store write fails | `logger.warning`, exception propagated to caller |
+| `apply_feedback()` exception | `logger.warning`, return `[]` (non-fatal) |
+| `get_calibrated_threshold()` store creation fails | Return `default` (50.0) |
+| Runtime reused across simulations | `_calibrated_historical_threshold` reset to 50.0 at `run()` start |
+
+### 5. Good/Base/Bad Cases
+
+- **Good**: Backtest with 20 cases, `signed_mape = +35%` → threshold raised from 50% to 67.5% (50 + 35×0.5 = 67.5, capped at 65) → subsequent simulations gate more strictly → predictions become more calibrated
+- **Base**: Backtest with `signed_mape = +5%` (< `bias_threshold_pct=10%`) → no adjustment
+- **Bad**: Backtest with `signed_mape = +200%`, `feedback_strength = 1.0` → raw adjustment = +200%, clamped to +15% → threshold goes from 50% to 65% (not extreme)
+
+### 6. Tests Required
+
+| Module | Key Assertions |
+|--------|---------------|
+| `test_calibration_feedback.py` | Bias extraction from global signed_mape; per-bucket extraction; min_cases filter; bias_threshold filter; threshold adjustment direction; feedback_strength dampening; max single adjustment cap (±15%); threshold bounds [10, 200]; cooldown skip same run_id; cooldown NOT freeze old adjustments; config validation (negative values, over-range); disabled config; CalibrationDataStore save/load roundtrip; atomic write; corrupted file tolerance |
+| `test_historical_calibrator.py` | `apply_calibration_feedback()` returns float; passes store param; returns calibrated value from store |
+| `test_backtest_integration.py` | `run_backtest(calibration_feedback_config=...)` triggers feedback; adjustments persisted |
+
+### 7. Wrong vs Correct
+
+#### Wrong: Cumulative cooldown permanently freezes buckets
+
+```python
+# Count ALL historical adjustments for a bucket
+recent_adjustments = store.get_adjustments(bucket_key)
+if len(recent_adjustments) >= config.cooldown_period:
+    continue  # Once bucket has N adjustments, it's permanently frozen!
+```
+
+#### Correct: Only check recent adjustments for same-run duplicates
+
+```python
+# Only look at recent N adjustments
+recent_subset = recent_adjustments[:config.cooldown_period]
+latest_run_ids = {a.run_id for a in recent_subset}
+if pattern.run_id in latest_run_ids:
+    continue  # Skip duplicate from same backtest run, allow new runs
+```
+
+#### Wrong: Threshold leaks across simulation runs
+
+```python
+class SimulationRuntime:
+    def _calibrate_historical(self, ...):
+        self._calibrated_historical_threshold = get_calibrated_threshold(...)
+        # NOT reset at run() start → previous run's threshold leaks into next run
+```
+
+#### Correct: Reset threshold at start of each simulation run
+
+```python
+class SimulationRuntime:
+    def run(self, ...):
+        self._calibrated_historical_threshold = 50.0  # Reset for each run
+        # ... rest of run logic
+```
+
+#### Wrong: Missing config validation on frozen dataclass
+
+```python
+@dataclass(frozen=True)
+class CalibrationFeedbackConfig:
+    feedback_strength: float = 0.5
+    # No __post_init__ → negative values accepted → adjustment direction inverted!
+```
+
+#### Correct: Validate in __post_init__
+
+```python
+@dataclass(frozen=True)
+class CalibrationFeedbackConfig:
+    feedback_strength: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.feedback_strength <= 1.0:
+            raise ValueError(f"feedback_strength must be in [0.0, 1.0], got {self.feedback_strength}")
+```
+
+---
+
 ## Tunable Parameters
 
 | Parameter | Owner | Default | Effect |
@@ -140,44 +341,37 @@ if not validation.passed:
 | `threshold` | `HistoricalCalibrator` | 100.0 | Deviation % triggering `lower_confidence` |
 | `p95_hard_cap` | `HistoricalCalibrator` | 200.0 | Deviation % above P95 → confidence "low" |
 | `historical_threshold_pct` | `ConfidenceGate` | 50.0 | Gate triggers when deviation > this % |
+| `feedback_strength` | `CalibrationFeedbackConfig` | 0.5 | How aggressively to adjust thresholds (0-1) |
+| `cooldown_period` | `CalibrationFeedbackConfig` | 3 | Min new backtest runs between adjustments |
+| `min_cases_for_adjustment` | `CalibrationFeedbackConfig` | 5 | Min backtest cases needed for adjustment |
+| `bias_threshold_pct` | `CalibrationFeedbackConfig` | 10.0 | Min |signed_mape| to trigger adjustment |
 
-Grid search: 4 values per param × 3 params = 64 candidates.
-
----
-
-## CLI Commands
-
-```bash
-# Run backtest and persist results
-ripple backtest run --persist
-
-# List persisted runs
-ripple backtest history [--limit N] [--json]
-
-# Run full feedback loop
-ripple backtest optimize
-
-# Run with auto-optimize after persist
-ripple backtest run --persist --auto-optimize
-```
+Grid search: 4 values per param × 3 params = 64 candidates (original tunables only).
 
 ---
 
 ## Data Flow
 
 ```
-run --persist
-  → simulate_fn per case → extract quality signals (ensemble_stability, tribunal_divergence, etc.)
-  → BacktestReport (with run_id, timestamp, params_snapshot, quality dimensions)
-  → BacktestStore.save()
+run_backtest(calibration_feedback_config=...)
+  → simulate_fn per case → extract quality signals
+  → BacktestReport (with signed_mape, buckets)
+  → apply_feedback()
+    → extract_bias_patterns() → List[BiasPattern]
+    → compute_threshold_adjustment() → List[CalibrationAdjustment]
+    → CalibrationDataStore.save_bias_pattern()
+    → CalibrationDataStore.save_adjustment()
+    → CalibrationDataStore.set_effective_threshold()
+  → BacktestStore.save() (if persist=True)
 
-optimize
-  → BacktestStore.query_recent()
-  → DeviationAnalyzer.analyze() → DeviationReport
-  → ParameterOptimizer.optimize() → OptimizationResult
-  → run_backtest(proposed_params) → trial BacktestReport (with quality dimensions)
-  → ABValidator.validate(baseline, trial) → ValidationResult
-  → if not passed: ABValidator.rollback() → previous params
+simulate()
+  → SimulationRuntime.run()
+    → _calibrated_historical_threshold = 50.0  # reset
+    → _calibrate_historical()
+      → apply_calibration_feedback() → get_calibrated_threshold()
+      → self._calibrated_historical_threshold = calibrated_value
+    → _evaluate_confidence_gate()
+      → ConfidenceGate.evaluate(historical_threshold_pct=self._calibrated_historical_threshold)
 ```
 
 ---
@@ -187,3 +381,5 @@ optimize
 - `query_recent(n)` reserved for `ripple doctor` bias trend surfacing
 - `sample_ratio` parameter in optimizer reserved for when real LLM backtest makes full re-run expensive
 - File lock / `is_running` flag in store for concurrent optimize protection
+- Cross-skill calibration sharing (currently out of scope)
+- Adaptive feedback_strength: auto-tune based on adjustment success rate

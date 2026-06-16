@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -342,3 +342,37 @@ class HistoricalCalibrator:
             bucket_key=bucket_key,
             warnings=warnings,
         )
+
+
+# ---------------------------------------------------------------------------
+# 校准反馈集成
+# ---------------------------------------------------------------------------
+
+def apply_calibration_feedback(
+    bucket_context: Optional[Dict[str, Any]] = None,
+    default_threshold: float = 50.0,
+    store: Any = None,
+) -> float:
+    """从 CalibrationDataStore 获取校准后的 historical_threshold_pct。
+
+    供 runtime 调用，将回测反馈闭环的阈值调整注入模拟流程。
+    此函数是非致命的 — 任何异常都会被捕获并返回默认阈值。
+
+    Args:
+        bucket_context: 分桶上下文（如 {"platform": "xiaohongshu"}）
+        default_threshold: 默认阈值
+        store: CalibrationDataStore 实例，None 使用默认路径
+
+    Returns:
+        校准后的 historical_threshold_pct
+    """
+    try:
+        from ripple.backtest.calibration_feedback import get_calibrated_threshold
+        return get_calibrated_threshold(
+            bucket_context=bucket_context,
+            default=default_threshold,
+            store=store,
+        )
+    except Exception as exc:
+        logger.debug("获取校准阈值失败，使用默认值 %.1f%%: %s", default_threshold, exc)
+        return default_threshold
