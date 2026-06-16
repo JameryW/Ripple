@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量规范 — ConfidenceGate 改动需遵循项目质量标准"}
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Provider 架构 — skill_prompt 注入模式需参考现有 provider 注入约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误处理 — majority vote 和梯度响应的边界条件处理需符合规范"}
