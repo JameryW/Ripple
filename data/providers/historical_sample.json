@@ -1,0 +1,122 @@
+[
+  {
+    "platform": "xiaohongshu",
+    "event_type": "post",
+    "title": "夏日穿搭分享",
+    "metrics": {
+      "impressions": 85000,
+      "engagement": 3200,
+      "likes": 2800,
+      "comments": 180,
+      "shares": 220,
+      "saves": 450
+    },
+    "performance_rating": "above_average",
+    "created_at": "2025-06-01"
+  },
+  {
+    "platform": "xiaohongshu",
+    "event_type": "post",
+    "title": "护肤好物推荐",
+    "metrics": {
+      "impressions": 120000,
+      "engagement": 5800,
+      "likes": 4500,
+      "comments": 350,
+      "shares": 480,
+      "saves": 920
+    },
+    "performance_rating": "strong",
+    "created_at": "2025-06-05"
+  },
+  {
+    "platform": "weibo",
+    "event_type": "post",
+    "title": "周末探店打卡",
+    "metrics": {
+      "impressions": 45000,
+      "engagement": 1800,
+      "likes": 1500,
+      "comments": 120,
+      "shares": 180,
+      "saves": 60
+    },
+    "performance_rating": "average",
+    "created_at": "2025-06-08"
+  },
+  {
+    "platform": "xiaohongshu",
+    "event_type": "post",
+    "title": "新品首发测评",
+    "metrics": {
+      "impressions": 200000,
+      "engagement": 12000,
+      "likes": 9500,
+      "comments": 800,
+      "shares": 950,
+      "saves": 1800
+    },
+    "performance_rating": "breakout",
+    "created_at": "2025-06-10"
+  },
+  {
+    "platform": "weibo",
+    "event_type": "post",
+    "title": "日常碎碎念",
+    "metrics": {
+      "impressions": 15000,
+      "engagement": 500,
+      "likes": 400,
+      "comments": 30,
+      "shares": 70,
+      "saves": 10
+    },
+    "performance_rating": "below_average",
+    "created_at": "2025-06-12"
+  },
+  {
+    "platform": "douyin",
+    "event_type": "video",
+    "title": "美食制作教程",
+    "metrics": {
+      "impressions": 350000,
+      "engagement": 28000,
+      "likes": 22000,
+      "comments": 1500,
+      "shares": 3200,
+      "saves": 5500
+    },
+    "performance_rating": "breakout",
+    "created_at": "2025-06-14"
+  },
+  {
+    "platform": "xiaohongshu",
+    "event_type": "post",
+    "title": "旅行攻略分享",
+    "metrics": {
+      "impressions": 65000,
+      "engagement": 2600,
+      "likes": 2100,
+      "comments": 200,
+      "shares": 150,
+      "saves": 380
+    },
+    "performance_rating": "above_average",
+    "created_at": "2025-06-15"
+  },
+  {
+    "platform": "weibo",
+    "event_type": "post",
+    "title": "热点事件评论",
+    "metrics": {
+      "impressions": 500000,
+      "engagement": 45000,
+      "likes": 38000,
+      "comments": 3200,
+      "shares": 5800,
+      "saves": 200
+    },
+    "performance_rating": "breakout",
+    "created_at": "2025-06-16"
+  }
+]

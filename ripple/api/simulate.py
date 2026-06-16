@@ -267,7 +267,7 @@ async def simulate(
     # --- PMF Validation extensions ---
     channel: Optional[str] = None,
     vertical: Optional[str] = None,
-    ensemble_runs: int = 1,
+    ensemble_runs: int = 2,
     deliberation_rounds: int = 3,
     redact_input: bool = False,
     # --- v5: DataSource Providers ---

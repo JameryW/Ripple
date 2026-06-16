@@ -2742,7 +2742,7 @@ def _build_request(
     request["max_llm_calls"] = _coerce_positive_int("max_llm_calls", request.get("max_llm_calls", 800))
     if ensemble_runs is not None:
         request["ensemble_runs"] = ensemble_runs
-    request["ensemble_runs"] = _coerce_positive_int("ensemble_runs", request.get("ensemble_runs", 1))
+    request["ensemble_runs"] = _coerce_positive_int("ensemble_runs", request.get("ensemble_runs", 2))
     if deliberation_rounds is not None:
         request["deliberation_rounds"] = deliberation_rounds
     request["deliberation_rounds"] = _coerce_positive_int("deliberation_rounds", request.get("deliberation_rounds", 3))
@@ -3156,7 +3156,7 @@ def _run_validation(skill: LoadedSkill, request: dict[str, Any], preflight: dict
     vertical_name = str(request.get("vertical") or "").strip()
     redact_input = bool(request.get("redact_input"))
     random_seed = request.get("random_seed")
-    ensemble_runs = int(request.get("ensemble_runs", 1) or 1)
+    ensemble_runs = int(request.get("ensemble_runs", 2) or 2)
 
     optional_items = [
         _validation_item(
@@ -3816,6 +3816,47 @@ def doctor(
         quality_ok = all(bool(v.get("ok", False)) for v in quality_checks.values() if isinstance(v, dict))
         quality_checks["ok"] = quality_ok
         checks["prediction_quality"] = quality_checks
+
+        # Provider health check
+        provider_checks: Dict[str, Any] = {}
+        try:
+            from ripple.providers.registry import ProviderRegistry
+
+            # Build registry from llm_config.yaml _providers section
+            _file_config = {}
+            try:
+                loader = LLMConfigLoader(config_file=config_file)
+                _file_config = getattr(loader, "_file_config", {})
+            except Exception:
+                pass
+            _yaml_providers_cfg = _file_config.get("_providers", {}) if isinstance(_file_config, dict) else {}
+
+            registry = ProviderRegistry(yaml_providers_cfg=_yaml_providers_cfg)
+
+            import asyncio
+            health_results = asyncio.get_event_loop().run_until_complete(registry.health_check_all())
+            for cat in ("historical", "topology", "embedding", "ambient"):
+                p = registry.get(cat)
+                is_stub = isinstance(p, (type(None),))
+                # Check if provider is a stub by checking its class name
+                p_class = type(p).__name__
+                is_stub_cls = "Stub" in p_class
+                provider_checks[cat] = {
+                    "ok": health_results.get(cat, False),
+                    "available": p.is_available() if hasattr(p, "is_available") else False,
+                    "impl": p_class,
+                    "is_stub": is_stub_cls,
+                }
+        except Exception as exc:
+            provider_checks["error"] = str(exc)
+
+        provider_ok = all(
+            v.get("available", False) or v.get("is_stub", True)
+            for v in provider_checks.values()
+            if isinstance(v, dict)
+        )
+        provider_checks["ok"] = provider_ok
+        checks["providers"] = provider_checks
 
         payload = {"checks": checks}
         overall_ok = all(bool(item.get("ok")) for item in checks.values())
