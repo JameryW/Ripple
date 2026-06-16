@@ -9,6 +9,7 @@ from ripple.providers.historical_calibrator import (
     CalibrationReport,
     HistoricalCalibrator,
     apply_calibration_feedback,
+    apply_calibrator_feedback,
     _build_bucket_key,
     _bucket_records,
     _compute_baselines,
@@ -270,3 +271,53 @@ class TestApplyCalibrationFeedback:
             default_threshold=50.0,
         )
         assert isinstance(result, float)
+
+
+# ---------------------------------------------------------------------------
+# apply_calibrator_feedback
+# ---------------------------------------------------------------------------
+
+class TestApplyCalibratorFeedback:
+    """Test apply_calibrator_feedback function for Path C integration."""
+
+    def test_returns_defaults_when_no_data(self):
+        """无校准数据时返回默认参数。"""
+        result = apply_calibrator_feedback(
+            bucket_context=None,
+        )
+        assert result == {"threshold": 100.0, "p95_hard_cap": 200.0}
+
+    def test_returns_calibrated_params(self):
+        """有校准数据时返回调整后的参数。"""
+        from ripple.backtest.calibration_feedback import (
+            CalibrationDataStore,
+        )
+
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("", threshold=75.0, p95_hard_cap=150.0)
+
+        result = apply_calibrator_feedback(
+            bucket_context=None,
+            default_threshold=100.0,
+            default_p95_hard_cap=200.0,
+            store=store,
+        )
+        assert result["threshold"] == 75.0
+        assert result["p95_hard_cap"] == 150.0
+
+    def test_with_bucket_context(self):
+        """带 bucket_context 时正常返回。"""
+        result = apply_calibrator_feedback(
+            bucket_context={"platform": "xiaohongshu"},
+        )
+        assert isinstance(result, dict)
+        assert "threshold" in result
+        assert "p95_hard_cap" in result
+
+    def test_non_fatal_on_failure(self):
+        """异常时返回默认参数。"""
+        result = apply_calibrator_feedback(
+            bucket_context="invalid",
+        )
+        assert isinstance(result, dict)
+        assert result == {"threshold": 100.0, "p95_hard_cap": 200.0}

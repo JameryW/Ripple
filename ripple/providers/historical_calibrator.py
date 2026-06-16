@@ -376,3 +376,40 @@ def apply_calibration_feedback(
     except Exception as exc:
         logger.debug("获取校准阈值失败，使用默认值 %.1f%%: %s", default_threshold, exc)
         return default_threshold
+
+
+def apply_calibrator_feedback(
+    bucket_context: Optional[Dict[str, Any]] = None,
+    default_threshold: float = 100.0,
+    default_p95_hard_cap: float = 200.0,
+    store: Any = None,
+) -> Dict[str, float]:
+    """从 CalibrationDataStore 获取校准后的 HistoricalCalibrator 参数。
+
+    供 runtime._calibrate_historical() 调用，将 Path C 优化闭环的
+    threshold 和 p95_hard_cap 注入 HistoricalCalibrator。
+    此函数是非致命的 — 任何异常都会被捕获并返回默认参数。
+
+    Args:
+        bucket_context: 分桶上下文（如 {"platform": "xiaohongshu"}）
+        default_threshold: 默认 threshold
+        default_p95_hard_cap: 默认 p95_hard_cap
+        store: CalibrationDataStore 实例，None 使用默认路径
+
+    Returns:
+        {"threshold": float, "p95_hard_cap": float}
+    """
+    try:
+        from ripple.backtest.calibration_feedback import get_calibrated_calibrator_params
+        return get_calibrated_calibrator_params(
+            bucket_context=bucket_context,
+            default_threshold=default_threshold,
+            default_p95_hard_cap=default_p95_hard_cap,
+            store=store,
+        )
+    except Exception as exc:
+        logger.debug(
+            "获取校准 calibrator 参数失败，使用默认值: %s",
+            exc,
+        )
+        return {"threshold": default_threshold, "p95_hard_cap": default_p95_hard_cap}

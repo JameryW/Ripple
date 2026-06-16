@@ -33,9 +33,27 @@ ParameterOptimizer(current_params: dict | None = None, grid: dict | None = None)
 
 # Validator
 ABValidator(degradation_threshold: float = 0.10)
-  .validate(baseline: BacktestReport, trial: BacktestReport) -> ValidationResult
+  .validate(cases, simulate_fn, old_params, new_params) -> ValidationResult
   .should_rollback(result: ValidationResult) -> bool
-  .rollback() -> dict  # returns previous params
+  .rollback(old_params: dict) -> dict
+
+# Persistence (Path C → CalibrationDataStore)
+CalibrationDataStore(data_dir: Path | None = None)
+  .set_effective_threshold(bucket_key, threshold_pct) -> None
+  .get_effective_threshold(bucket_key, default) -> float | None
+  .set_calibrator_params(bucket_key, threshold, p95_hard_cap) -> None
+  .get_calibrator_params(bucket_key) -> dict | None
+
+apply_optimization_result(opt_result: OptimizationResult, store: CalibrationDataStore, bucket_key: str, validation_passed: bool) -> dict
+  # Returns {"written": bool, "reason": str, "params_written": dict}
+
+# Runtime bridges
+get_calibrated_threshold(bucket_context, default, store) -> float
+get_calibrated_calibrator_params(bucket_context, store) -> dict  # {"threshold": X, "p95_hard_cap": Y}
+apply_calibrator_feedback(bucket_context, store) -> dict          # {"threshold": X, "p95_hard_cap": Y}
+
+# CLI
+ripple-cli backtest optimize [--apply] [--recent N] [--json]
 ```
 
 ### 3. Contracts
@@ -94,12 +112,17 @@ ABValidator(degradation_threshold: float = 0.10)
 | No previous params to rollback to | `rollback()` returns `DEFAULT_PARAMS` |
 | Store path does not exist | `BacktestStore.save()` creates parent dirs |
 | Single report in store | Optimizer produces neutral result, A/B trivially passes |
+| `--apply` not set (default) | Dry-run: no CalibrationDataStore writes, print yellow status |
+| `--apply` set, A/B passed | Write all 3 params to CalibrationDataStore, print green status |
+| `--apply` set, A/B failed | No writes, print red status (rollback) |
+| Partial proposed_params (missing threshold or p95_hard_cap) | `apply_optimization_result` logs warning, skips calibrator_params write, still writes historical_threshold_pct |
+| `apply_optimization_result` exception | Returns `{"written": False, "reason": str(exc)}` (non-fatal) |
 
 ### 5. Good/Base/Bad Cases
 
-- **Good**: 3+ persisted runs with consistent over-predict bias → optimizer lowers thresholds → A/B validates improvement
-- **Base**: 2 runs with mixed bias → neutral result → DEFAULT_PARAMS returned
-- **Bad**: Optimizer proposes aggressive param shift → A/B catches > 10% degradation → rollback fires
+- **Good**: 3+ persisted runs with consistent over-predict bias → optimizer lowers thresholds → A/B validates improvement → `--apply` writes to CalibrationDataStore → subsequent simulate uses calibrated params
+- **Base**: 2 runs with mixed bias → neutral result → DEFAULT_PARAMS returned → dry-run, no writes
+- **Bad**: Optimizer proposes aggressive param shift → A/B catches > 10% degradation → rollback fires → even with `--apply`, no writes
 
 ### 6. Tests Required
 
@@ -110,6 +133,7 @@ ABValidator(degradation_threshold: float = 0.10)
 | `test_optimizer.py` | Over-predict → lower thresholds, under-predict → higher thresholds, neutral → defaults, custom grid |
 | `test_validator.py` | No-degradation passes, degradation triggers rollback, rollback returns old params, custom threshold |
 | `test_backtest.py` | Quality signal extraction, aggregation, backward compatibility, graceful defaults |
+| `test_calibration_feedback.py` | `apply_optimization_result` writes all 3 params; validation_failed → no write; partial params → warning + skip calibrator_params; `get_calibrated_calibrator_params` bucket matching; `set/get_calibrator_params` roundtrip |
 
 ### 7. Wrong vs Correct
 
@@ -118,17 +142,35 @@ ABValidator(degradation_threshold: float = 0.10)
 ```python
 # Apply proposed params directly without validation
 params = optimizer.optimize(deviation).proposed_params
-apply_params(params)  # Could degrade metrics!
+apply_optimization_result(opt_result, store, validation_passed=True)  # Always writes!
 ```
 
 #### Correct: A/B validate before applying
 
 ```python
 result = optimizer.optimize(deviation)
-trial_report = run_backtest(cases, params=result.proposed_params)
-validation = validator.validate(baseline_report, trial_report)
-if not validation.passed:
-    params = validator.rollback()
+val_result = await validator.validate(cases, simulate_fn, current_params, result.proposed_params)
+if val_result.passed and not val_result.rolled_back:
+    apply_optimization_result(opt_result, store, validation_passed=True)
+else:
+    restored = validator.rollback(current_params)
+```
+
+#### Wrong: Always write on `--apply` regardless of validation
+
+```python
+if apply_flag:
+    apply_optimization_result(opt_result, store, validation_passed=True)  # Ignores A/B result!
+```
+
+#### Correct: Gate write on A/B validation result
+
+```python
+if apply_flag and val_result.passed and not val_result.rolled_back:
+    apply_optimization_result(opt_result, store, validation_passed=True)
+elif apply_flag:
+    # A/B failed — do NOT write
+    console.print("[red]A/B validation failed — optimization result NOT written[/red]")
 ```
 
 ---
@@ -352,6 +394,8 @@ Grid search: 4 values per param × 3 params = 64 candidates (original tunables o
 
 ## Data Flow
 
+### Path B — Auto-Threshold (run_backtest → CalibrationDataStore)
+
 ```
 run_backtest(calibration_feedback_config=...)
   → simulate_fn per case → extract quality signals
@@ -363,15 +407,50 @@ run_backtest(calibration_feedback_config=...)
     → CalibrationDataStore.save_adjustment()
     → CalibrationDataStore.set_effective_threshold()
   → BacktestStore.save() (if persist=True)
+```
 
+### Path C — Full Optimize Loop (CLI → CalibrationDataStore)
+
+```
+ripple-cli backtest optimize --apply
+  → BacktestStore.query_recent(n=5)
+  → DeviationAnalyzer.analyze() → DeviationReport
+  → ParameterOptimizer.optimize() → OptimizationResult (3 params)
+  → ABValidator.validate(old_params, new_params) → ValidationResult
+  → if --apply and val_result.passed and not rolled_back:
+      → apply_optimization_result(opt_result, store, validation_passed=True)
+        → CalibrationDataStore.set_effective_threshold("historical_threshold_pct")
+        → CalibrationDataStore.set_calibrator_params(threshold, p95_hard_cap)
+  → else if --apply and failed:
+      → no writes, print rollback
+  → else (no --apply):
+      → dry-run, no writes
+```
+
+### Runtime reads calibrated params (both Path B and Path C)
+
+```
 simulate()
   → SimulationRuntime.run()
     → _calibrated_historical_threshold = 50.0  # reset
+    → _calibrated_calibrator_params = None     # reset
     → _calibrate_historical()
       → apply_calibration_feedback() → get_calibrated_threshold()
-      → self._calibrated_historical_threshold = calibrated_value
+        → ConfidenceGate: historical_threshold_pct
+      → apply_calibrator_feedback() → get_calibrated_calibrator_params()
+        → HistoricalCalibrator(threshold=X, p95_hard_cap=Y)
     → _evaluate_confidence_gate()
       → ConfidenceGate.evaluate(historical_threshold_pct=self._calibrated_historical_threshold)
+```
+
+### CalibrationDataStore File Layout
+
+```
+~/.ripple/data/calibration/
+  bias_patterns.json       — append-only list of BiasPattern dicts
+  adjustments.json         — append-only list of CalibrationAdjustment dicts
+  thresholds.json          — {bucket_key: historical_threshold_pct}
+  calibrator_params.json   — {bucket_key: {"threshold": float, "p95_hard_cap": float}}
 ```
 
 ---
@@ -383,3 +462,4 @@ simulate()
 - File lock / `is_running` flag in store for concurrent optimize protection
 - Cross-skill calibration sharing (currently out of scope)
 - Adaptive feedback_strength: auto-tune based on adjustment success rate
+- Real LLM A/B validation (currently uses mock simulate_fn from seed fixtures)

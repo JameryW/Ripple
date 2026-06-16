@@ -136,7 +136,8 @@ class CalibrationDataStore:
         {dir}/
           bias_patterns.json     — 偏差模式列表
           adjustments.json       — 调整记录列表
-          thresholds.json        — 当前生效的阈值映射
+          thresholds.json        — 当前生效的阈值映射（historical_threshold_pct）
+          calibrator_params.json — HistoricalCalibrator 参数映射（threshold, p95_hard_cap）
     """
 
     def __init__(self, data_dir: Optional[Path] = None) -> None:
@@ -305,6 +306,59 @@ class CalibrationDataStore:
     def get_all_thresholds(self) -> Dict[str, float]:
         """获取所有生效阈值。"""
         return dict(self._read_thresholds())
+
+    # ── Calibrator 参数映射 ──────────────────────────────────────────────
+
+    def _read_calibrator_params(self) -> Dict[str, Dict[str, float]]:
+        """读取 calibrator 参数映射 {bucket_key: {"threshold": float, "p95_hard_cap": float}}。"""
+        data = self._read_json("calibrator_params.json")
+        if isinstance(data, dict):
+            result: Dict[str, Dict[str, float]] = {}
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    result[k] = {
+                        pk: float(pv)
+                        for pk, pv in v.items()
+                        if isinstance(pv, (int, float)) and pk in ("threshold", "p95_hard_cap")
+                    }
+            return result
+        return {}
+
+    def _save_calibrator_params(self, params: Dict[str, Dict[str, float]]) -> None:
+        """保存 calibrator 参数映射。"""
+        self._atomic_write_json("calibrator_params.json", params)
+
+    def set_calibrator_params(
+        self,
+        bucket_key: str,
+        threshold: float,
+        p95_hard_cap: float,
+    ) -> None:
+        """设置某 bucket 的 HistoricalCalibrator 参数。
+
+        Args:
+            bucket_key: 分桶键（空字符串表示全局）
+            threshold: HistoricalCalibrator 的 threshold 参数
+            p95_hard_cap: HistoricalCalibrator 的 p95_hard_cap 参数
+        """
+        params = self._read_calibrator_params()
+        params[bucket_key] = {"threshold": threshold, "p95_hard_cap": p95_hard_cap}
+        self._save_calibrator_params(params)
+
+    def get_calibrator_params(
+        self,
+        bucket_key: str,
+    ) -> Optional[Dict[str, float]]:
+        """获取某 bucket 的 HistoricalCalibrator 参数。
+
+        Args:
+            bucket_key: 分桶键
+
+        Returns:
+            {"threshold": float, "p95_hard_cap": float} 或 None
+        """
+        params = self._read_calibrator_params()
+        return params.get(bucket_key)
 
 
 # ---------------------------------------------------------------------------
@@ -622,3 +676,159 @@ def get_calibrated_threshold(
         return global_threshold
 
     return default
+
+
+# ---------------------------------------------------------------------------
+# Path C 集成：优化结果写入 CalibrationDataStore
+# ---------------------------------------------------------------------------
+
+def apply_optimization_result(
+    opt_result: Any,
+    store: CalibrationDataStore,
+    bucket_key: str = "",
+    validation_passed: bool = True,
+) -> Dict[str, Any]:
+    """将 ParameterOptimizer 的优化结果写入 CalibrationDataStore。
+
+    只在 A/B 验证通过时写入，包含全部 3 个可调参数：
+    - historical_threshold_pct → thresholds.json
+    - threshold → calibrator_params.json
+    - p95_hard_cap → calibrator_params.json
+
+    此方法是非致命的 — 任何异常都会被捕获并记录，不会中断调用方。
+
+    Args:
+        opt_result: OptimizationResult 实例
+        store: 校准数据存储
+        bucket_key: 分桶键（空字符串表示全局）
+        validation_passed: A/B 验证是否通过
+
+    Returns:
+        写入状态字典 {"written": bool, "params": dict, "bucket_key": str}
+    """
+    try:
+        if not validation_passed:
+            logger.info("A/B 验证未通过，不写入优化结果")
+            return {"written": False, "params": {}, "bucket_key": bucket_key, "reason": "validation_failed"}
+
+        proposed = opt_result.proposed_params
+        if not proposed:
+            logger.info("无优化参数可写入")
+            return {"written": False, "params": {}, "bucket_key": bucket_key, "reason": "no_params"}
+
+        # 写入 historical_threshold_pct → thresholds
+        hist_threshold = proposed.get("historical_threshold_pct")
+        if hist_threshold is not None:
+            store.set_effective_threshold(bucket_key, float(hist_threshold))
+
+        # 写入 threshold + p95_hard_cap → calibrator_params
+        threshold = proposed.get("threshold")
+        p95_hard_cap = proposed.get("p95_hard_cap")
+        if threshold is not None and p95_hard_cap is not None:
+            store.set_calibrator_params(
+                bucket_key,
+                threshold=float(threshold),
+                p95_hard_cap=float(p95_hard_cap),
+            )
+        elif threshold is not None or p95_hard_cap is not None:
+            # threshold 和 p95_hard_cap 必须同时存在才能写入 calibrator_params
+            logger.warning(
+                "优化结果中 threshold 和 p95_hard_cap 不完整，跳过 calibrator_params 写入: "
+                "threshold=%s, p95_hard_cap=%s",
+                threshold,
+                p95_hard_cap,
+            )
+
+        logger.info(
+            "优化结果已写入 CalibrationDataStore: bucket=%s, params=%s",
+            bucket_key,
+            proposed,
+        )
+        return {"written": True, "params": dict(proposed), "bucket_key": bucket_key}
+
+    except Exception as exc:
+        logger.warning("写入优化结果失败（非致命）: %s", exc)
+        return {"written": False, "params": {}, "bucket_key": bucket_key, "reason": str(exc)}
+
+
+def get_calibrated_calibrator_params(
+    bucket_context: Optional[Dict[str, Any]] = None,
+    default_threshold: float = 100.0,
+    default_p95_hard_cap: float = 200.0,
+    store: Optional[CalibrationDataStore] = None,
+) -> Dict[str, float]:
+    """获取校准后的 HistoricalCalibrator 参数（threshold, p95_hard_cap）。
+
+    供 runtime._calibrate_historical() 调用，将 Path C 优化闭环的参数
+    注入 HistoricalCalibrator。
+
+    分桶匹配优先级与 get_calibrated_threshold 一致：
+    1. 精确多字段匹配
+    2. 单字段匹配
+    3. 全局参数
+    4. 默认值
+
+    Args:
+        bucket_context: 分桶上下文（如 {"platform": "xiaohongshu"}）
+        default_threshold: 默认 threshold
+        default_p95_hard_cap: 默认 p95_hard_cap
+        store: 校准数据存储，None 使用默认路径
+
+    Returns:
+        {"threshold": float, "p95_hard_cap": float}
+    """
+    if store is None:
+        try:
+            store = CalibrationDataStore()
+        except Exception as exc:
+            logger.debug("创建 CalibrationDataStore 失败，使用默认 calibrator 参数: %s", exc)
+            return {"threshold": default_threshold, "p95_hard_cap": default_p95_hard_cap}
+
+    # 尝试匹配分桶键
+    if bucket_context:
+        bucket_fields = ["platform", "channel", "vertical"]
+        parts = []
+        for f in bucket_fields:
+            v = bucket_context.get(f)
+            if v:
+                parts.append(f"{f}={v}")
+        bucket_key = ",".join(parts) if parts else ""
+
+        # 先尝试精确匹配
+        if bucket_key:
+            params = store.get_calibrator_params(bucket_key)
+            if params is not None and "threshold" in params and "p95_hard_cap" in params:
+                logger.debug(
+                    "使用校准 calibrator 参数 bucket=%s: threshold=%.1f, p95_hard_cap=%.1f",
+                    bucket_key,
+                    params["threshold"],
+                    params["p95_hard_cap"],
+                )
+                return params
+
+        # 再尝试单字段匹配
+        for f in bucket_fields:
+            v = bucket_context.get(f)
+            if v:
+                single_key = f"{f}={v}"
+                params = store.get_calibrator_params(single_key)
+                if params is not None and "threshold" in params and "p95_hard_cap" in params:
+                    logger.debug(
+                        "使用校准 calibrator 参数（单字段匹配）bucket=%s: threshold=%.1f, p95_hard_cap=%.1f",
+                        single_key,
+                        params["threshold"],
+                        params["p95_hard_cap"],
+                    )
+                    return params
+
+    # 全局参数
+    global_params = store.get_calibrator_params("")
+    if global_params is not None and "threshold" in global_params and "p95_hard_cap" in global_params:
+        logger.debug(
+            "使用全局校准 calibrator 参数: threshold=%.1f, p95_hard_cap=%.1f",
+            global_params["threshold"],
+            global_params["p95_hard_cap"],
+        )
+        return global_params
+
+    return {"threshold": default_threshold, "p95_hard_cap": default_p95_hard_cap}

@@ -5248,6 +5248,10 @@ def backtest_optimize(
         int,
         typer.Option("--recent", "-n", help="分析最近 N 次运行记录。"),
     ] = 5,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="写入优化结果到 CalibrationDataStore（默认 dry-run）。"),
+    ] = False,
 ) -> None:
     """Read recent backtest history, compute bias, propose new params, and A/B validate.
 
@@ -5257,6 +5261,7 @@ def backtest_optimize(
     3. Runs ParameterOptimizer to propose corrective parameters.
     4. Runs A/B validation (backtest with old vs new params).
     5. If validation passes, shows proposed params; if fails, shows rollback message.
+    6. With --apply, writes optimization result to CalibrationDataStore for subsequent simulate() runs.
     """
     import asyncio as _asyncio
     from ripple.backtest.store import BacktestStore
@@ -5325,9 +5330,27 @@ def backtest_optimize(
 
     # Step 4: Handle rollback if needed
     if validator.should_rollback(val_result):
-        restored = validator.rollback(current_params)
+        validator.rollback(current_params)
         val_result.rolled_back = True
         val_result.warnings.append("Rollback triggered: restored previous parameter snapshot.")
+
+    # Step 5: Write to CalibrationDataStore if --apply and validation passed
+    write_status: dict = {"written": False, "params": {}, "bucket_key": "", "reason": "dry_run"}
+    if apply:
+        if val_result.passed and not val_result.rolled_back:
+            from ripple.backtest.calibration_feedback import (
+                CalibrationDataStore as _CalibrationDataStore,
+                apply_optimization_result as _apply_opt,
+            )
+            cal_store = _CalibrationDataStore()
+            write_status = _apply_opt(
+                opt_result,
+                cal_store,
+                bucket_key="",
+                validation_passed=True,
+            )
+        else:
+            write_status = {"written": False, "params": {}, "bucket_key": "", "reason": "validation_failed"}
 
     # Output
     if json_output:
@@ -5362,6 +5385,7 @@ def backtest_optimize(
                 "degraded_metrics": val_result.degraded_metrics,
                 "rolled_back": val_result.rolled_back,
             },
+            "write_status": write_status,
         }
         typer.echo(json.dumps(output, ensure_ascii=False, indent=2))
     else:
@@ -5400,6 +5424,21 @@ def backtest_optimize(
             console.print("[red]ROLLBACK: Restored previous parameter snapshot.[/red]")
         elif val_result.passed:
             console.print("[green]Validation passed. Proposed parameters are safe to apply.[/green]")
+
+        # 写入状态
+        console.print()
+        console.print(Rule("CalibrationDataStore Write Status"))
+        if write_status.get("written"):
+            console.print("[green]Optimization result written to CalibrationDataStore[/green]")
+            console.print(f"  Bucket key:  {write_status.get('bucket_key', '')}")
+            console.print(f"  Params:      {write_status.get('params', {})}")
+        elif write_status.get("reason") == "validation_failed":
+            console.print("[red]A/B validation failed — optimization result NOT written[/red]")
+        elif write_status.get("reason") == "dry_run":
+            console.print("[yellow]Dry run — use --apply to write results to CalibrationDataStore[/yellow]")
+        else:
+            reason = write_status.get("reason", "unknown")
+            console.print(f"[yellow]Not written (reason: {reason})[/yellow]")
 
 
 @backtest_app.command("history", help="List persisted backtest run history.")
