@@ -44,6 +44,7 @@ class DeliberationOrchestrator:
         rubric: str,
         max_rounds: int = 4,
         system_prompt: str = "",
+        skill_prompt: str = "",
         on_progress: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ):
         self.members = members
@@ -60,6 +61,7 @@ class DeliberationOrchestrator:
                 expertise=m.expertise,
                 llm_caller=llm_caller,
                 system_prompt=system_prompt,
+                skill_prompt=skill_prompt,
             )
             for m in members
         ]
