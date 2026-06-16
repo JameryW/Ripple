@@ -1,306 +1,624 @@
 # ripple/backtest/calibration_feedback.py
-"""Calibration Feedback Loop — BacktestReport → ConfidenceGate threshold adjustment.
+"""Calibration feedback loop — BacktestReport -> HistoricalCalibrator -> ConfidenceGate.
 
-Reads recent BacktestReports via DeviationAnalyzer, extracts bias patterns,
-and produces calibration adjustments that ConfidenceGate uses in subsequent runs.
+回测结果自动提取偏差模式，调整 confidence 阈值和 provider 数据，
+使后续预测质量持续改善。
 
-The loop is:
-  1. Backtest runs produce BacktestReports (existing)
-  2. DeviationAnalyzer extracts BiasSignals (existing)
-  3. CalibrationFeedbackLoop converts BiasSignals → ConfidenceAdjustments (NEW)
-  4. Adjustments are persisted to a YAML config file (NEW)
-  5. ConfidenceGate reads adjusted thresholds on next simulation (existing, via historical_threshold_pct)
+闭环流程：
+1. 回测完成后，从 BacktestReport 提取偏差模式（signed_mape）
+2. 偏差模式写入 CalibrationDataStore
+3. 模拟运行时，从 store 读取校准数据，调整 historical_threshold_pct
+4. 调整后的阈值传入 ConfidenceGate.evaluate()
 
-Design principles:
-  - Conservative: adjustments are capped to avoid overfitting
-  - Requires minimum sample size before producing adjustments
-  - Cool-down: only one adjustment per N hours
-  - All adjustments are logged for auditability
+设计要点：
+- 非致命：反馈失败不应中断回测或模拟流程
+- 可配置：开关、反馈强度、冷却期
+- 原子写入：temp + rename 模式保证数据一致性
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import math
-from dataclasses import dataclass, field
+import os
+import tempfile
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
-
-from ripple.backtest.analyzer import BiasSignal, DeviationAnalyzer, DeviationReport
 from ripple.backtest.schema import BacktestReport
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 数据存储路径
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CALIBRATION_DIR = Path.home() / ".ripple" / "data" / "calibration"
+
 
 # ---------------------------------------------------------------------------
-# Data models
+# 配置
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CalibrationFeedbackConfig:
+    """校准反馈闭环配置。
+
+    Attributes:
+        enabled: 是否启用闭环反馈
+        feedback_strength: 反馈强度 (0.0-1.0)，越大则阈值调整越激进
+        cooldown_period: 冷却期 — 两次调整之间至少需要的回测次数
+        min_cases_for_adjustment: 触发调整所需的最小回测样本数
+        bias_threshold_pct: 偏差阈值 (%) — signed_mape 超过此值才触发调整
+    """
+    enabled: bool = True
+    feedback_strength: float = 0.5
+    cooldown_period: int = 3
+    min_cases_for_adjustment: int = 5
+    bias_threshold_pct: float = 10.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.feedback_strength <= 1.0:
+            raise ValueError(
+                f"feedback_strength 必须在 [0.0, 1.0] 范围内，当前值: {self.feedback_strength}"
+            )
+        if self.cooldown_period < 0:
+            raise ValueError(
+                f"cooldown_period 不能为负数，当前值: {self.cooldown_period}"
+            )
+        if self.min_cases_for_adjustment < 0:
+            raise ValueError(
+                f"min_cases_for_adjustment 不能为负数，当前值: {self.min_cases_for_adjustment}"
+            )
+        if self.bias_threshold_pct < 0:
+            raise ValueError(
+                f"bias_threshold_pct 不能为负数，当前值: {self.bias_threshold_pct}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 数据模型
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BiasPattern:
+    """从回测报告中提取的偏差模式。
+
+    Attributes:
+        bucket_key: 分桶键（如 "platform=xiaohongshu"），空字符串表示全局
+        signed_mape: 对称有符号 MAPE（正值=系统性高估，负值=系统性低估）
+        sample_size: 样本数量
+        timestamp: 提取时间（ISO 8601）
+        run_id: 来源回测的 run_id
+    """
+    bucket_key: str
+    signed_mape: float
+    sample_size: int
+    timestamp: str
+    run_id: str
 
 
 @dataclass(frozen=True)
-class ConfidenceAdjustment:
-    """A single adjustment to a ConfidenceGate parameter."""
-    parameter: str  # e.g. "historical_threshold_pct", "evidence_positive_threshold"
-    original_value: float
-    adjusted_value: float
+class CalibrationAdjustment:
+    """一次校准调整记录。
+
+    Attributes:
+        bucket_key: 分桶键
+        old_threshold_pct: 调整前的 historical_threshold_pct
+        new_threshold_pct: 调整后的 historical_threshold_pct
+        reason: 调整原因描述
+        timestamp: 调整时间（ISO 8601）
+        run_id: 触发调整的回测 run_id
+        feedback_strength: 本次使用的反馈强度
+    """
+    bucket_key: str
+    old_threshold_pct: float
+    new_threshold_pct: float
     reason: str
-    bias_direction: str  # "over_predict" | "under_predict" | "neutral"
-    magnitude: float  # |signed_mape|
-    sample_count: int
-
-
-@dataclass
-class CalibrationFeedbackResult:
-    """Result of running the calibration feedback loop."""
-    adjustments: List[ConfidenceAdjustment] = field(default_factory=list)
-    overall_bias: str = "neutral"
-    overall_signed_mape: float = 0.0
-    sample_count: int = 0
-    skipped: bool = False
-    skip_reason: str = ""
-    timestamp: str = ""
-
-    @property
-    def has_adjustments(self) -> bool:
-        return bool(self.adjustments)
+    timestamp: str
+    run_id: str
+    feedback_strength: float
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# CalibrationDataStore — 基于 JSON 文件的持久化存储
 # ---------------------------------------------------------------------------
 
-_CALIBRATION_FEEDBACK_FILE = "calibration_feedback.yaml"
+class CalibrationDataStore:
+    """校准数据的持久化存储。
 
+    使用 JSON 文件存储偏差模式和调整记录，支持按 bucket_key 查询。
+    文件写入采用 temp + rename 原子模式。
 
-def _feedback_path(data_dir: Path) -> Path:
-    return data_dir / _CALIBRATION_FEEDBACK_FILE
-
-
-def load_calibration_feedback(data_dir: Path) -> Dict[str, Any]:
-    """Load persisted calibration feedback from YAML.
-
-    Returns empty dict if file doesn't exist.
+    存储结构：
+        {dir}/
+          bias_patterns.json     — 偏差模式列表
+          adjustments.json       — 调整记录列表
+          thresholds.json        — 当前生效的阈值映射
     """
-    path = _feedback_path(data_dir)
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:
-        logger.warning("Failed to load calibration feedback from %s: %s", path, exc)
-        return {}
 
+    def __init__(self, data_dir: Optional[Path] = None) -> None:
+        if data_dir is None:
+            data_dir = _DEFAULT_CALIBRATION_DIR
+        self._data_dir = Path(data_dir)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
 
-def save_calibration_feedback(data_dir: Path, feedback: Dict[str, Any]) -> None:
-    """Persist calibration feedback to YAML."""
-    path = _feedback_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(path, "w") as f:
-            yaml.safe_dump(feedback, f, allow_unicode=True, sort_keys=False)
-        logger.info("Calibration feedback saved to %s", path)
-    except Exception as exc:
-        logger.warning("Failed to save calibration feedback to %s: %s", path, exc)
+    # ── 原子写入 ─────────────────────────────────────────────────────────
 
-
-def get_adjusted_threshold(data_dir: Path, default: float = 50.0) -> float:
-    """Get the adjusted historical_threshold_pct from persisted feedback.
-
-    Returns the default if no feedback exists or feedback is stale.
-    """
-    data = load_calibration_feedback(data_dir)
-    if not data:
-        return default
-
-    # Check cool-down: skip if adjusted too recently
-    last_adjusted = data.get("last_adjusted_at")
-    if last_adjusted:
+    def _atomic_write_json(self, filename: str, data: Any) -> None:
+        """原子写入 JSON 文件（temp + rename）。"""
+        target = self._data_dir / filename
         try:
-            last_dt = datetime.fromisoformat(last_adjusted)
-            hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
-            cool_down_hours = data.get("cool_down_hours", 24)
-            if hours_since < cool_down_hours:
-                logger.debug(
-                    "Calibration feedback within cool-down (%.1fh < %dh), using adjusted value",
-                    hours_since, cool_down_hours,
-                )
-        except (ValueError, TypeError):
-            pass
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self._data_dir),
+                prefix=f".{filename}.tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+                os.replace(tmp_path, str(target))
+            except BaseException:
+                # 清理临时文件
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            logger.warning("原子写入 %s 失败: %s", filename, exc)
+            raise
 
-    adjustments = data.get("adjustments", [])
-    for adj in adjustments:
-        if isinstance(adj, dict) and adj.get("parameter") == "historical_threshold_pct":
-            return float(adj.get("adjusted_value", default))
+    # ── 读取 ─────────────────────────────────────────────────────────────
 
-    return default
+    def _read_json(self, filename: str) -> Any:
+        """读取 JSON 文件，文件不存在时返回空列表。"""
+        path = self._data_dir / filename
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("读取 %s 失败: %s", filename, exc)
+            return []
 
+    # ── BiasPattern 操作 ─────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# CalibrationFeedbackLoop
-# ---------------------------------------------------------------------------
+    def save_bias_pattern(self, pattern: BiasPattern) -> None:
+        """保存一个偏差模式记录。"""
+        patterns = self._read_json("bias_patterns.json")
+        patterns.append(asdict(pattern))
+        self._atomic_write_json("bias_patterns.json", patterns)
 
-
-class CalibrationFeedbackLoop:
-    """Convert backtest deviation signals into ConfidenceGate parameter adjustments.
-
-    Parameters
-    ----------
-    min_runs : int
-        Minimum number of backtest runs required to produce adjustments.
-    max_adjustment_pct : float
-        Maximum percentage-point adjustment per loop iteration (caps overfitting).
-    cool_down_hours : int
-        Minimum hours between adjustments (prevents rapid oscillation).
-    data_dir : Path or None
-        Directory for persisting feedback. If None, feedback is not persisted.
-    """
-
-    def __init__(
+    def get_bias_patterns(
         self,
-        min_runs: int = 3,
-        max_adjustment_pct: float = 15.0,
-        cool_down_hours: int = 24,
-        data_dir: Optional[Path] = None,
-    ) -> None:
-        self._analyzer = DeviationAnalyzer(min_runs=min_runs)
-        self._max_adjustment_pct = max_adjustment_pct
-        self._cool_down_hours = cool_down_hours
-        self._data_dir = data_dir
-
-    def run(
-        self,
-        reports: List[BacktestReport],
-        current_threshold: float = 50.0,
-    ) -> CalibrationFeedbackResult:
-        """Run the calibration feedback loop.
+        bucket_key: Optional[str] = None,
+    ) -> List[BiasPattern]:
+        """获取偏差模式记录。
 
         Args:
-            reports: Recent BacktestReports to analyze.
-            current_threshold: Current historical_threshold_pct value.
+            bucket_key: 分桶键，None 表示返回所有记录
 
         Returns:
-            CalibrationFeedbackResult with adjustments (if any).
+            偏差模式列表，按 timestamp 倒序排列
         """
-        result = CalibrationFeedbackResult(timestamp=datetime.now(timezone.utc).isoformat())
+        raw_list = self._read_json("bias_patterns.json")
+        patterns = []
+        for raw in raw_list:
+            try:
+                p = BiasPattern(
+                    bucket_key=raw.get("bucket_key", ""),
+                    signed_mape=float(raw.get("signed_mape", 0)),
+                    sample_size=int(raw.get("sample_size", 0)),
+                    timestamp=raw.get("timestamp", ""),
+                    run_id=raw.get("run_id", ""),
+                )
+                patterns.append(p)
+            except (TypeError, ValueError) as exc:
+                logger.warning("跳过无效偏差记录: %s", exc)
+                continue
 
-        # Step 1: Check cool-down
-        if self._data_dir is not None:
-            feedback = load_calibration_feedback(self._data_dir)
-            last_adjusted = feedback.get("last_adjusted_at")
-            if last_adjusted:
-                try:
-                    last_dt = datetime.fromisoformat(last_adjusted)
-                    hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
-                    if hours_since < self._cool_down_hours:
-                        result.skipped = True
-                        result.skip_reason = (
-                            f"Within cool-down period ({hours_since:.1f}h < {self._cool_down_hours}h)"
-                        )
-                        return result
-                except (ValueError, TypeError):
-                    pass
+        if bucket_key is not None:
+            patterns = [p for p in patterns if p.bucket_key == bucket_key]
 
-        # Step 2: Analyze deviation
-        deviation = self._analyzer.analyze(reports)
-        result.overall_bias = deviation.overall_bias
-        result.overall_signed_mape = deviation.overall_signed_mape
-        result.sample_count = deviation.sample_count
+        # 按 timestamp 倒序
+        patterns.sort(key=lambda p: p.timestamp, reverse=True)
+        return patterns
 
-        if deviation.overall_bias == "neutral":
-            result.skipped = True
-            result.skip_reason = "No systematic bias detected (neutral)"
-            return result
+    # ── CalibrationAdjustment 操作 ───────────────────────────────────────
 
-        if deviation.sample_count < self._analyzer._min_runs:
-            result.skipped = True
-            result.skip_reason = f"Insufficient samples ({deviation.sample_count} < {self._analyzer._min_runs})"
-            return result
+    def save_adjustment(self, adjustment: CalibrationAdjustment) -> None:
+        """保存一个调整记录。"""
+        adjustments = self._read_json("adjustments.json")
+        adjustments.append(asdict(adjustment))
+        self._atomic_write_json("adjustments.json", adjustments)
 
-        # Step 3: Compute adjustments
-        adjustments = self._compute_adjustments(deviation, current_threshold)
-        result.adjustments = adjustments
-
-        # Step 4: Persist if data_dir is configured
-        if self._data_dir is not None and adjustments:
-            self._persist(adjustments, deviation)
-
-        return result
-
-    def _compute_adjustments(
+    def get_adjustments(
         self,
-        deviation: DeviationReport,
-        current_threshold: float,
-    ) -> List[ConfidenceAdjustment]:
-        """Convert deviation signals into parameter adjustments."""
-        adjustments: List[ConfidenceAdjustment] = []
+        bucket_key: Optional[str] = None,
+    ) -> List[CalibrationAdjustment]:
+        """获取调整记录。
 
-        # Adjustment 1: historical_threshold_pct
-        # If over-predicting, tighten the threshold (lower → more likely to gate)
-        # If under-predicting, relax the threshold (higher → less likely to gate)
-        signed_mape = deviation.overall_signed_mape
+        Args:
+            bucket_key: 分桶键，None 表示返回所有记录
 
-        # Scale adjustment: use sqrt to dampen large biases
-        # Cap at max_adjustment_pct
-        raw_adjustment = math.copysign(
-            min(math.sqrt(abs(signed_mape)) * 2.0, self._max_adjustment_pct),
-            signed_mape,
+        Returns:
+            调整记录列表，按 timestamp 倒序排列
+        """
+        raw_list = self._read_json("adjustments.json")
+        adjustments = []
+        for raw in raw_list:
+            try:
+                a = CalibrationAdjustment(
+                    bucket_key=raw.get("bucket_key", ""),
+                    old_threshold_pct=float(raw.get("old_threshold_pct", 50)),
+                    new_threshold_pct=float(raw.get("new_threshold_pct", 50)),
+                    reason=raw.get("reason", ""),
+                    timestamp=raw.get("timestamp", ""),
+                    run_id=raw.get("run_id", ""),
+                    feedback_strength=float(raw.get("feedback_strength", 0.5)),
+                )
+                adjustments.append(a)
+            except (TypeError, ValueError) as exc:
+                logger.warning("跳过无效调整记录: %s", exc)
+                continue
+
+        if bucket_key is not None:
+            adjustments = [a for a in adjustments if a.bucket_key == bucket_key]
+
+        # 按 timestamp 倒序
+        adjustments.sort(key=lambda a: a.timestamp, reverse=True)
+        return adjustments
+
+    # ── 阈值映射 ─────────────────────────────────────────────────────────
+
+    def _read_thresholds(self) -> Dict[str, float]:
+        """读取当前生效的阈值映射 {bucket_key: threshold_pct}。"""
+        data = self._read_json("thresholds.json")
+        if isinstance(data, dict):
+            return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+        return {}
+
+    def _save_thresholds(self, thresholds: Dict[str, float]) -> None:
+        """保存阈值映射。"""
+        self._atomic_write_json("thresholds.json", thresholds)
+
+    def set_effective_threshold(self, bucket_key: str, threshold_pct: float) -> None:
+        """设置某 bucket 的生效阈值。"""
+        thresholds = self._read_thresholds()
+        thresholds[bucket_key] = threshold_pct
+        self._save_thresholds(thresholds)
+
+    def get_effective_threshold(
+        self,
+        bucket_key: str,
+        default: Optional[float] = 50.0,
+    ) -> Optional[float]:
+        """获取某 bucket 的生效阈值，不存在时返回 default。"""
+        thresholds = self._read_thresholds()
+        if bucket_key in thresholds:
+            return thresholds[bucket_key]
+        return default
+
+    def get_all_thresholds(self) -> Dict[str, float]:
+        """获取所有生效阈值。"""
+        return dict(self._read_thresholds())
+
+
+# ---------------------------------------------------------------------------
+# 偏差提取
+# ---------------------------------------------------------------------------
+
+def extract_bias_patterns(
+    report: BacktestReport,
+    config: CalibrationFeedbackConfig,
+) -> List[BiasPattern]:
+    """从 BacktestReport 提取偏差模式。
+
+    提取全局偏差和每个分桶的偏差。只提取样本数 >= min_cases_for_adjustment
+    且 |signed_mape| >= bias_threshold_pct 的偏差模式。
+
+    Args:
+        report: 回测报告
+        config: 反馈配置
+
+    Returns:
+        偏差模式列表
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    patterns: List[BiasPattern] = []
+
+    # 全局偏差
+    if report.signed_mape is not None and report.completed_cases >= config.min_cases_for_adjustment:
+        if abs(report.signed_mape) >= config.bias_threshold_pct:
+            patterns.append(BiasPattern(
+                bucket_key="",
+                signed_mape=report.signed_mape,
+                sample_size=report.completed_cases,
+                timestamp=now,
+                run_id=report.run_id,
+            ))
+
+    # 分桶偏差
+    for bucket_key, bucket_data in report.buckets.items():
+        if not isinstance(bucket_data, dict):
+            continue
+        bucket_signed_mape = bucket_data.get("signed_mape")
+        bucket_count = bucket_data.get("count", 0)
+        if bucket_signed_mape is None:
+            continue
+        if not isinstance(bucket_signed_mape, (int, float)):
+            continue
+        if int(bucket_count) < config.min_cases_for_adjustment:
+            continue
+        if abs(float(bucket_signed_mape)) < config.bias_threshold_pct:
+            continue
+
+        patterns.append(BiasPattern(
+            bucket_key=bucket_key,
+            signed_mape=float(bucket_signed_mape),
+            sample_size=int(bucket_count),
+            timestamp=now,
+            run_id=report.run_id,
+        ))
+
+    return patterns
+
+
+# ---------------------------------------------------------------------------
+# 阈值调整计算
+# ---------------------------------------------------------------------------
+
+def compute_threshold_adjustment(
+    patterns: List[BiasPattern],
+    store: CalibrationDataStore,
+    config: CalibrationFeedbackConfig,
+) -> List[CalibrationAdjustment]:
+    """根据偏差模式计算阈值调整。
+
+    调整逻辑：
+    - signed_mape > 0 (系统性高估) → 提高 threshold_pct（更严格的门控）
+    - signed_mape < 0 (系统性低估) → 降低 threshold_pct（更宽松的门控）
+    - 调整幅度 = |signed_mape| * feedback_strength，有上限
+    - 冷却期：最近 cooldown_period 次回测内已调整过则跳过
+
+    Args:
+        patterns: 偏差模式列表
+        store: 校准数据存储（用于查询冷却期）
+        config: 反馈配置
+
+    Returns:
+        调整记录列表
+    """
+    if not patterns:
+        return []
+
+    adjustments: List[CalibrationAdjustment] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 按 bucket_key 分组，每组取最新一条
+    bucket_latest: Dict[str, BiasPattern] = {}
+    for p in patterns:
+        # 同一 bucket 只保留 signed_mape 绝对值最大的
+        if p.bucket_key not in bucket_latest or abs(p.signed_mape) > abs(bucket_latest[p.bucket_key].signed_mape):
+            bucket_latest[p.bucket_key] = p
+
+    for bucket_key, pattern in bucket_latest.items():
+        # 当前生效阈值
+        current_threshold = store.get_effective_threshold(bucket_key, default=50.0)
+        if current_threshold is None:
+            current_threshold = 50.0
+
+        # 冷却期检查：查询该 bucket 的最近调整
+        recent_adjustments = store.get_adjustments(bucket_key)
+        if recent_adjustments:
+            # 只看最近 cooldown_period 条记录，避免永久冻结
+            recent_subset = recent_adjustments[:config.cooldown_period]
+            # 如果最近 cooldown_period 次调整中最新一次的 run_id 与当前相同，
+            # 说明当前回测已产生过调整 → 跳过（防止同一回测重复调整）
+            latest_run_ids = {a.run_id for a in recent_subset}
+            if pattern.run_id in latest_run_ids:
+                logger.info(
+                    "冷却期中，跳过 bucket=%s 的阈值调整（当前 run_id=%s 已有调整记录）",
+                    bucket_key,
+                    pattern.run_id,
+                )
+                continue
+
+        # 计算调整量
+        # signed_mape > 0 → 高估 → 提高 threshold（更严格）
+        # signed_mape < 0 → 低估 → 降低 threshold（更宽松）
+        raw_adjustment = pattern.signed_mape * config.feedback_strength
+        # 限制单次调整幅度，避免过激
+        max_single_adjustment = 15.0  # 一次最多调整 15%
+        clamped_adjustment = max(-max_single_adjustment, min(max_single_adjustment, raw_adjustment))
+
+        new_threshold = current_threshold + clamped_adjustment
+        # 阈值范围 [10, 200]
+        new_threshold = max(10.0, min(200.0, new_threshold))
+
+        if new_threshold == current_threshold:
+            continue
+
+        # 确定原因
+        if pattern.signed_mape > 0:
+            direction = "高估"
+        else:
+            direction = "低估"
+
+        reason = (
+            f"回测 run_id={pattern.run_id} 检测到{direction}偏差 "
+            f"(signed_mape={pattern.signed_mape:.1f}%, "
+            f"sample_size={pattern.sample_size})，"
+            f"阈值从 {current_threshold:.1f}% 调整至 {new_threshold:.1f}% "
+            f"(feedback_strength={config.feedback_strength})"
         )
 
-        # Over-predict → lower threshold (stricter gate)
-        # Under-predict → raise threshold (looser gate)
-        if signed_mape > 0:
-            new_threshold = max(10.0, current_threshold - abs(raw_adjustment))
-        else:
-            new_threshold = min(200.0, current_threshold + abs(raw_adjustment))
+        adjustment = CalibrationAdjustment(
+            bucket_key=bucket_key,
+            old_threshold_pct=current_threshold,
+            new_threshold_pct=new_threshold,
+            reason=reason,
+            timestamp=now,
+            run_id=pattern.run_id,
+            feedback_strength=config.feedback_strength,
+        )
+        adjustments.append(adjustment)
 
-        if abs(new_threshold - current_threshold) > 0.5:  # minimum meaningful change
-            adjustments.append(ConfidenceAdjustment(
-                parameter="historical_threshold_pct",
-                original_value=round(current_threshold, 2),
-                adjusted_value=round(new_threshold, 2),
-                reason=(
-                    f"Systematic {'over-prediction' if signed_mape > 0 else 'under-prediction'} "
-                    f"(signed_mape={signed_mape:+.1f}%) — "
-                    f"{'tightening' if signed_mape > 0 else 'relaxing'} historical threshold"
-                ),
-                bias_direction=deviation.overall_bias,
-                magnitude=abs(signed_mape),
-                sample_count=deviation.sample_count,
-            ))
+    return adjustments
+
+
+# ---------------------------------------------------------------------------
+# 主入口：应用反馈
+# ---------------------------------------------------------------------------
+
+def apply_feedback(
+    report: BacktestReport,
+    store: CalibrationDataStore,
+    config: Optional[CalibrationFeedbackConfig] = None,
+) -> List[CalibrationAdjustment]:
+    """应用校准反馈闭环。
+
+    流程：提取偏差 → 计算调整 → 持久化 → 日志记录
+
+    此方法是非致命的 — 任何异常都会被捕获并记录，不会中断调用方。
+
+    Args:
+        report: 回测报告
+        store: 校准数据存储
+        config: 反馈配置，None 使用默认配置
+
+    Returns:
+        调整记录列表（可能为空）
+    """
+    if config is None:
+        config = CalibrationFeedbackConfig()
+
+    if not config.enabled:
+        logger.info("校准反馈闭环已禁用，跳过")
+        return []
+
+    try:
+        # Step 1: 提取偏差模式
+        patterns = extract_bias_patterns(report, config)
+        if not patterns:
+            logger.info("回测 run_id=%s 未检测到显著偏差模式", report.run_id)
+            return []
+
+        logger.info(
+            "回测 run_id=%s 检测到 %d 个偏差模式",
+            report.run_id,
+            len(patterns),
+        )
+        for p in patterns:
+            logger.info(
+                "  偏差模式: bucket=%s, signed_mape=%.1f%%, sample=%d",
+                p.bucket_key,
+                p.signed_mape,
+                p.sample_size,
+            )
+
+        # Step 2: 计算阈值调整
+        adjustments = compute_threshold_adjustment(patterns, store, config)
+        if not adjustments:
+            logger.info("回测 run_id=%s 未产生阈值调整", report.run_id)
+            return []
+
+        # Step 3: 持久化偏差模式和调整
+        for p in patterns:
+            store.save_bias_pattern(p)
+
+        for adj in adjustments:
+            store.save_adjustment(adj)
+            # 更新生效阈值
+            store.set_effective_threshold(adj.bucket_key, adj.new_threshold_pct)
+
+            # Step 4: 日志记录
+            logger.info(
+                "校准调整: bucket=%s, 阈值 %.1f%% -> %.1f%%, 原因: %s",
+                adj.bucket_key,
+                adj.old_threshold_pct,
+                adj.new_threshold_pct,
+                adj.reason,
+            )
 
         return adjustments
 
-    def _persist(
-        self,
-        adjustments: List[ConfidenceAdjustment],
-        deviation: DeviationReport,
-    ) -> None:
-        """Persist adjustments to YAML."""
-        if self._data_dir is None:
-            return
+    except Exception as exc:
+        logger.warning("校准反馈闭环异常（非致命）: %s", exc)
+        return []
 
-        feedback = {
-            "last_adjusted_at": datetime.now(timezone.utc).isoformat(),
-            "cool_down_hours": self._cool_down_hours,
-            "overall_bias": deviation.overall_bias,
-            "overall_signed_mape": deviation.overall_signed_mape,
-            "sample_count": deviation.sample_count,
-            "adjustments": [
-                {
-                    "parameter": a.parameter,
-                    "original_value": a.original_value,
-                    "adjusted_value": a.adjusted_value,
-                    "reason": a.reason,
-                    "bias_direction": a.bias_direction,
-                    "magnitude": a.magnitude,
-                    "sample_count": a.sample_count,
-                }
-                for a in adjustments
-            ],
-        }
-        save_calibration_feedback(self._data_dir, feedback)
+
+# ---------------------------------------------------------------------------
+# 运行时集成：为 HistoricalCalibrator / ConfidenceGate 提供校准阈值
+# ---------------------------------------------------------------------------
+
+def get_calibrated_threshold(
+    bucket_context: Optional[Dict[str, Any]] = None,
+    default: float = 50.0,
+    store: Optional[CalibrationDataStore] = None,
+) -> float:
+    """获取校准后的 historical_threshold_pct。
+
+    供 runtime._calibrate_historical() 和 _evaluate_confidence_gate() 调用，
+    将校准反馈数据注入模拟流程。
+
+    Args:
+        bucket_context: 分桶上下文（如 {"platform": "xiaohongshu"}）
+        default: 默认阈值
+        store: 校准数据存储，None 使用默认路径
+
+    Returns:
+        校准后的 historical_threshold_pct
+    """
+    if store is None:
+        try:
+            store = CalibrationDataStore()
+        except Exception as exc:
+            logger.debug("创建 CalibrationDataStore 失败，使用默认阈值: %s", exc)
+            return default
+
+    # 尝试匹配分桶键
+    if bucket_context:
+        bucket_fields = ["platform", "channel", "vertical"]
+        parts = []
+        for f in bucket_fields:
+            v = bucket_context.get(f)
+            if v:
+                parts.append(f"{f}={v}")
+        bucket_key = ",".join(parts) if parts else ""
+
+        # 先尝试精确匹配
+        if bucket_key:
+            threshold = store.get_effective_threshold(bucket_key, default=None)
+            if threshold is not None:
+                logger.debug(
+                    "使用校准阈值 bucket=%s: %.1f%%",
+                    bucket_key,
+                    threshold,
+                )
+                return threshold
+
+        # 再尝试单字段匹配
+        for f in bucket_fields:
+            v = bucket_context.get(f)
+            if v:
+                single_key = f"{f}={v}"
+                threshold = store.get_effective_threshold(single_key, default=None)
+                if threshold is not None:
+                    logger.debug(
+                        "使用校准阈值（单字段匹配）bucket=%s: %.1f%%",
+                        single_key,
+                        threshold,
+                    )
+                    return threshold
+
+    # 全局阈值
+    global_threshold = store.get_effective_threshold("", default=None)
+    if global_threshold is not None:
+        logger.debug("使用全局校准阈值: %.1f%%", global_threshold)
+        return global_threshold
+
+    return default

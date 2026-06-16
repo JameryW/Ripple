@@ -1,14 +1,14 @@
 # tests/providers/test_historical_calibrator.py
 """Tests for HistoricalCalibrator — R4 percentile baselines, bucketing, and calibration actions."""
 
-import pytest
+import tempfile
+from pathlib import Path
 
 from ripple.providers.historical_calibrator import (
     CalibrationAction,
     CalibrationReport,
-    CalibratedMetric,
     HistoricalCalibrator,
-    PercentileBaseline,
+    apply_calibration_feedback,
     _build_bucket_key,
     _bucket_records,
     _compute_baselines,
@@ -210,3 +210,63 @@ class TestCalibrationReport:
             CalibrationAction(action_type="lower_confidence", metric="views", reason="test")
         ])
         assert report.has_actions
+
+
+# ---------------------------------------------------------------------------
+# apply_calibration_feedback
+# ---------------------------------------------------------------------------
+
+class TestApplyCalibrationFeedback:
+    """Test apply_calibration_feedback function that bridges backtest feedback to runtime."""
+
+    def test_returns_default_when_no_data(self):
+        """无校准数据时返回默认阈值。"""
+        result = apply_calibration_feedback(
+            bucket_context=None,
+            default_threshold=50.0,
+        )
+        assert result == 50.0
+
+    def test_returns_calibrated_threshold(self):
+        """有校准数据时返回调整后的阈值。"""
+        from ripple.backtest.calibration_feedback import (
+            CalibrationDataStore,
+            CalibrationFeedbackConfig,
+        )
+        from ripple.backtest.schema import BacktestReport
+
+        # 创建 store 并写入校准数据
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        report = BacktestReport(
+            signed_mape=20.0,
+            completed_cases=10,
+            total_cases=10,
+        )
+        config = CalibrationFeedbackConfig(feedback_strength=0.5)
+        from ripple.backtest.calibration_feedback import apply_feedback
+        apply_feedback(report, store, config)
+
+        # 传入同一个 store 实例，验证校准后的阈值
+        result = apply_calibration_feedback(
+            bucket_context=None,
+            default_threshold=50.0,
+            store=store,
+        )
+        assert result == 60.0  # 50 + 20 * 0.5 = 60
+
+    def test_with_bucket_context(self):
+        """带 bucket_context 时正常返回。"""
+        result = apply_calibration_feedback(
+            bucket_context={"platform": "xiaohongshu"},
+            default_threshold=50.0,
+        )
+        assert isinstance(result, float)
+
+    def test_non_fatal_on_failure(self):
+        """异常时返回默认阈值。"""
+        # 传入异常的 bucket_context 类型
+        result = apply_calibration_feedback(
+            bucket_context="invalid",
+            default_threshold=50.0,
+        )
+        assert isinstance(result, float)

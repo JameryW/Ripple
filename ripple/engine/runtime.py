@@ -254,6 +254,7 @@ class SimulationRuntime:
         self._evidence_pack_v2: Any = None  # R2: upgraded evidence pack dataclass
         self._run_id: Optional[str] = None  # stored for evidence pack ids
         self._calibration_report: Any = None  # R4: calibration report with actions
+        self._calibrated_historical_threshold: float = 50.0  # 校准反馈闭环：调整后的阈值
 
         # 构建阶段序列（支持 Skill 注册额外阶段）/ Build phase sequence (supports Skill extra phases)
         self._phases = self._build_phase_sequence(extra_phases)
@@ -533,6 +534,8 @@ class SimulationRuntime:
         """
         run_id = run_id or str(uuid.uuid4())[:8]
         self._run_id = run_id
+        # 重置每次模拟的校准阈值，防止前次运行的阈值泄漏
+        self._calibrated_historical_threshold = 50.0
         logger.info(f"[{run_id}] 开始模拟")
 
         # Job-level timeout: wrap entire simulation in asyncio.wait_for
@@ -1503,13 +1506,15 @@ class SimulationRuntime:
         """R4: Calibrate prediction against historical data with percentile baselines.
 
         Returns a CalibrationReport with structured actions, or None on failure.
+        校准反馈闭环：从 CalibrationDataStore 获取调整后的阈值，
+        传入 HistoricalCalibrator 和 ConfidenceGate。
         """
         historical = simulation_input.get("historical")
         if not historical or not isinstance(historical, list):
             return None
 
         try:
-            from ripple.providers.historical_calibrator import HistoricalCalibrator
+            from ripple.providers.historical_calibrator import HistoricalCalibrator, apply_calibration_feedback
             calibrator = HistoricalCalibrator()
 
             # Build bucket context from simulation input
@@ -1518,6 +1523,14 @@ class SimulationRuntime:
                 val = simulation_input.get(key)
                 if val:
                     bucket_context[key] = val
+
+            # 校准反馈闭环：获取调整后的 historical_threshold_pct
+            calibrated_threshold = apply_calibration_feedback(
+                bucket_context=bucket_context or None,
+                default_threshold=50.0,
+            )
+            # 存储校准阈值供 _evaluate_confidence_gate 使用
+            self._calibrated_historical_threshold = calibrated_threshold
 
             report = calibrator.calibrate(
                 synthesize_result.get("prediction", {}),
@@ -1819,7 +1832,7 @@ class SimulationRuntime:
             ensemble_stability=ensemble_stability,
             ensemble_agreement_rate=agreement_rate,
             historical_max_deviation_pct=hist_max_dev,
-            historical_threshold_pct=hist_threshold_pct,
+            historical_threshold_pct=getattr(self, "_calibrated_historical_threshold", 50.0),
             evidence_positive_count=pos_count,
             evidence_negative_count=neg_count,
             evidence_silent_count=silent_count,
