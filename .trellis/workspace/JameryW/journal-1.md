@@ -309,15 +309,15 @@ Implemented full backtest feedback loop (Path C): SQLite persistence (BacktestSt
 - None - task complete
 
 
-## Session 10: Refine ConfidenceGate: majority vote, gradient evidence balance, skill_prompt
+## Session 10: Calibration feedback loop: BacktestReport -> ConfidenceGate
 
 **Date**: 2026-06-16
-**Task**: Refine ConfidenceGate: majority vote, gradient evidence balance, skill_prompt
-**Branch**: `feat/refine-confidence-gate-tribunal-cap-and-evidence-balance`
+**Task**: Calibration feedback loop: BacktestReport -> ConfidenceGate
+**Branch**: `main`
 
 ### Summary
 
-Optimized ConfidenceGate: tribunal cap from min to majority vote, evidence_balance from binary to 3-level gradient, TribunalAgent skill_prompt injection. 880 tests pass. PR #13.
+Implemented closed-loop feedback from BacktestReport to ConfidenceGate. New: CalibrationFeedbackConfig, BiasPattern, CalibrationAdjustment, CalibrationDataStore (JSON-based, atomic writes), extract_bias_patterns, compute_threshold_adjustment, apply_feedback, get_calibrated_threshold. Modified: runner.py (feedback config param), runtime.py (calibrated threshold integration), historical_calibrator.py (bridge function). trellis-check fixed 3 bugs (cooldown permanent freeze, threshold cross-run leak, config validation). 84 tests passing. PR #17 MERGEABLE after conflict resolution (3 files: ours vs HEAD YAML-based implementation).
 
 ### Main Changes
 
@@ -327,7 +327,7 @@ Optimized ConfidenceGate: tribunal cap from min to majority vote, evidence_balan
 
 | Hash | Message |
 |------|---------|
-| `1d91187` | (see git log) |
+| `650c995` | (see git log) |
 
 ### Testing
 

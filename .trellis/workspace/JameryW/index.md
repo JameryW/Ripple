@@ -29,7 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
-| 10 | 2026-06-16 | Refine ConfidenceGate: majority vote, gradient evidence balance, skill_prompt | `1d91187` | `feat/refine-confidence-gate-tribunal-cap-and-evidence-balance` |
+| 10 | 2026-06-16 | Calibration feedback loop: BacktestReport -> ConfidenceGate | `650c995` | `main` |
 | 9 | 2026-06-15 | Backtest feedback loop full architecture | `3e4c506` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 8 | 2026-06-15 | Fix ensemble merging, stability direction, median adjustment reachability, signed MAPE | `4d82a16` | `feat/sse-wave-progress-and-api-runtime-fields` |
 | 7 | 2026-06-14 | Close prediction quality loop: calibration rewrites, tribunal audit, SSE fields, backtest fixtures | `1e38d94` | `feat/sse-wave-progress-and-api-runtime-fields` |

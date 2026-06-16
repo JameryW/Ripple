@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量规范 — provider 配置和 ensemble 默认值改动需遵循项目质量标准"}
+{"file": ".trellis/spec/backend/provider-architecture.md", "reason": "Provider 架构 — provider 配置指南需参考现有 provider 注入约定"}
