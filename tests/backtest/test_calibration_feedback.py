@@ -12,8 +12,10 @@ from ripple.backtest.calibration_feedback import (
     CalibrationDataStore,
     CalibrationFeedbackConfig,
     apply_feedback,
+    apply_optimization_result,
     compute_threshold_adjustment,
     extract_bias_patterns,
+    get_calibrated_calibrator_params,
     get_calibrated_threshold,
 )
 from ripple.backtest.schema import BacktestReport
@@ -795,3 +797,264 @@ class TestEndToEndFeedback:
         # 阈值应该高于第一次
         threshold = get_calibrated_threshold(default=50.0, store=store2)
         assert threshold > 50.0
+
+
+# ---------------------------------------------------------------------------
+# CalibrationDataStore — calibrator_params
+# ---------------------------------------------------------------------------
+
+class TestCalibratorParamsStore:
+    """CalibrationDataStore 的 calibrator_params 读写测试。"""
+
+    def test_set_and_get_calibrator_params(self, tmp_path):
+        """设置和读取 calibrator 参数。"""
+        store = _make_store(tmp_path)
+        # 默认返回 None
+        assert store.get_calibrator_params("platform=xiaohongshu") is None
+
+        # 设置后读取
+        store.set_calibrator_params("platform=xiaohongshu", threshold=75.0, p95_hard_cap=150.0)
+        params = store.get_calibrator_params("platform=xiaohongshu")
+        assert params is not None
+        assert params["threshold"] == 75.0
+        assert params["p95_hard_cap"] == 150.0
+
+    def test_global_calibrator_params(self, tmp_path):
+        """全局 calibrator 参数（bucket_key=""）。"""
+        store = _make_store(tmp_path)
+        store.set_calibrator_params("", threshold=120.0, p95_hard_cap=250.0)
+        params = store.get_calibrator_params("")
+        assert params is not None
+        assert params["threshold"] == 120.0
+        assert params["p95_hard_cap"] == 250.0
+
+    def test_different_buckets_independent(self, tmp_path):
+        """不同 bucket 的参数互不影响。"""
+        store = _make_store(tmp_path)
+        store.set_calibrator_params("platform=xiaohongshu", threshold=75.0, p95_hard_cap=150.0)
+        store.set_calibrator_params("platform=weibo", threshold=90.0, p95_hard_cap=180.0)
+
+        xhs = store.get_calibrator_params("platform=xiaohongshu")
+        assert xhs["threshold"] == 75.0
+        assert xhs["p95_hard_cap"] == 150.0
+
+        weibo = store.get_calibrator_params("platform=weibo")
+        assert weibo["threshold"] == 90.0
+        assert weibo["p95_hard_cap"] == 180.0
+
+    def test_overwrite_calibrator_params(self, tmp_path):
+        """覆盖已存在的参数。"""
+        store = _make_store(tmp_path)
+        store.set_calibrator_params("test", threshold=75.0, p95_hard_cap=150.0)
+        store.set_calibrator_params("test", threshold=80.0, p95_hard_cap=160.0)
+
+        params = store.get_calibrator_params("test")
+        assert params["threshold"] == 80.0
+        assert params["p95_hard_cap"] == 160.0
+
+    def test_corrupted_calibrator_params_returns_empty(self, tmp_path):
+        """损坏的 JSON 文件返回空映射。"""
+        store = _make_store(tmp_path)
+        bad_file = store._data_dir / "calibrator_params.json"
+        bad_file.parent.mkdir(parents=True, exist_ok=True)
+        bad_file.write_text("{invalid json")
+        # 应该优雅地返回 None
+        assert store.get_calibrator_params("test") is None
+
+
+# ---------------------------------------------------------------------------
+# apply_optimization_result
+# ---------------------------------------------------------------------------
+
+class TestApplyOptimizationResult:
+    """优化结果写入 CalibrationDataStore 的测试。"""
+
+    def _make_opt_result(self, proposed=None, current=None):
+        """创建一个简化的 OptimizationResult。"""
+        from ripple.backtest.schema import OptimizationResult
+        return OptimizationResult(
+            proposed_params=proposed if proposed is not None else {"threshold": 75.0, "p95_hard_cap": 150.0, "historical_threshold_pct": 37.5},
+            current_params=current if current is not None else {"threshold": 100.0, "p95_hard_cap": 200.0, "historical_threshold_pct": 50.0},
+            score=0.5,
+            improvement_estimate=15.0,
+            bias_direction="over_predict",
+        )
+
+    def test_writes_all_3_params_when_validation_passed(self, tmp_path):
+        """验证通过时写入全部 3 个参数。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result()
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=True)
+
+        assert status["written"] is True
+        assert status["params"]["threshold"] == 75.0
+        assert status["params"]["p95_hard_cap"] == 150.0
+        assert status["params"]["historical_threshold_pct"] == 37.5
+
+        # 验证 thresholds.json 已写入
+        assert store.get_effective_threshold("") == 37.5
+
+        # 验证 calibrator_params.json 已写入
+        cal_params = store.get_calibrator_params("")
+        assert cal_params is not None
+        assert cal_params["threshold"] == 75.0
+        assert cal_params["p95_hard_cap"] == 150.0
+
+    def test_does_not_write_when_validation_failed(self, tmp_path):
+        """A/B 验证失败时不写入。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result()
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=False)
+
+        assert status["written"] is False
+        assert status["reason"] == "validation_failed"
+
+        # 验证 store 没有写入任何数据
+        assert store.get_effective_threshold("", 50.0) == 50.0
+        assert store.get_calibrator_params("") is None
+
+    def test_does_not_write_when_no_params(self, tmp_path):
+        """无优化参数时不写入。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result(proposed={})
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=True)
+
+        assert status["written"] is False
+        assert status["reason"] == "no_params"
+
+    def test_writes_to_specific_bucket(self, tmp_path):
+        """写入指定 bucket_key。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result()
+        status = apply_optimization_result(
+            opt_result, store, bucket_key="platform=xiaohongshu", validation_passed=True,
+        )
+
+        assert status["written"] is True
+        assert store.get_effective_threshold("platform=xiaohongshu") == 37.5
+
+        cal_params = store.get_calibrator_params("platform=xiaohongshu")
+        assert cal_params is not None
+        assert cal_params["threshold"] == 75.0
+
+    def test_non_fatal_on_store_failure(self, tmp_path):
+        """存储写入失败不应导致异常。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result()
+        # 覆盖原子写入方法使其抛出异常
+        store._atomic_write_json = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("write failed"))
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=True)
+
+        assert status["written"] is False
+        assert "reason" in status
+
+    def test_partial_params_only_historical_threshold(self, tmp_path):
+        """只有 historical_threshold_pct 时，写入阈值但不写 calibrator_params。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result(
+            proposed={"historical_threshold_pct": 37.5},
+        )
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=True)
+
+        assert status["written"] is True
+        # historical_threshold_pct 应写入
+        assert store.get_effective_threshold("") == 37.5
+        # calibrator_params 不应写入（缺少 threshold 和 p95_hard_cap）
+        assert store.get_calibrator_params("") is None
+
+    def test_partial_params_threshold_without_p95(self, tmp_path):
+        """只有 threshold 没有 p95_hard_cap 时，不写 calibrator_params。"""
+        store = _make_store(tmp_path)
+        opt_result = self._make_opt_result(
+            proposed={"threshold": 75.0, "historical_threshold_pct": 37.5},
+        )
+        status = apply_optimization_result(opt_result, store, bucket_key="", validation_passed=True)
+
+        assert status["written"] is True
+        # historical_threshold_pct 应写入
+        assert store.get_effective_threshold("") == 37.5
+        # calibrator_params 不应写入（缺少 p95_hard_cap）
+        assert store.get_calibrator_params("") is None
+
+
+# ---------------------------------------------------------------------------
+# get_calibrated_calibrator_params
+# ---------------------------------------------------------------------------
+
+class TestGetCalibratedCalibratorParams:
+    """获取校准后 calibrator 参数的测试。"""
+
+    def test_no_calibration_data(self):
+        """无校准数据时返回默认参数。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        result = get_calibrated_calibrator_params(store=store)
+        assert result == {"threshold": 100.0, "p95_hard_cap": 200.0}
+
+    def test_exact_bucket_match(self):
+        """精确匹配分桶键。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("platform=xiaohongshu,channel=generic", threshold=75.0, p95_hard_cap=150.0)
+        result = get_calibrated_calibrator_params(
+            bucket_context={"platform": "xiaohongshu", "channel": "generic"},
+            store=store,
+        )
+        assert result["threshold"] == 75.0
+        assert result["p95_hard_cap"] == 150.0
+
+    def test_single_field_fallback(self):
+        """无法精确匹配时回退到单字段匹配。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("platform=xiaohongshu", threshold=80.0, p95_hard_cap=160.0)
+        result = get_calibrated_calibrator_params(
+            bucket_context={"platform": "xiaohongshu", "channel": "unknown"},
+            store=store,
+        )
+        assert result["threshold"] == 80.0
+        assert result["p95_hard_cap"] == 160.0
+
+    def test_global_fallback(self):
+        """无分桶匹配时使用全局参数。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("", threshold=120.0, p95_hard_cap=250.0)
+        result = get_calibrated_calibrator_params(
+            bucket_context={"platform": "weibo"},
+            store=store,
+        )
+        assert result["threshold"] == 120.0
+        assert result["p95_hard_cap"] == 250.0
+
+    def test_default_when_no_match(self):
+        """无任何匹配时返回默认值。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("platform=xiaohongshu", threshold=80.0, p95_hard_cap=160.0)
+        result = get_calibrated_calibrator_params(
+            bucket_context={"platform": "weibo"},
+            store=store,
+        )
+        assert result == {"threshold": 100.0, "p95_hard_cap": 200.0}
+
+    def test_no_bucket_context(self):
+        """无 bucket_context 时使用全局参数。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        store.set_calibrator_params("", threshold=120.0, p95_hard_cap=250.0)
+        result = get_calibrated_calibrator_params(
+            bucket_context=None,
+            store=store,
+        )
+        assert result["threshold"] == 120.0
+        assert result["p95_hard_cap"] == 250.0
+
+    def test_default_store_creation_failure(self):
+        """默认 store 创建失败时返回默认参数。"""
+        result = get_calibrated_calibrator_params()
+        assert result == {"threshold": 100.0, "p95_hard_cap": 200.0}
+
+    def test_custom_defaults(self):
+        """自定义默认值。"""
+        store = CalibrationDataStore(data_dir=Path(tempfile.mkdtemp()))
+        result = get_calibrated_calibrator_params(
+            default_threshold=150.0,
+            default_p95_hard_cap=300.0,
+            store=store,
+        )
+        assert result == {"threshold": 150.0, "p95_hard_cap": 300.0}

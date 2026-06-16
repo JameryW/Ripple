@@ -255,6 +255,7 @@ class SimulationRuntime:
         self._run_id: Optional[str] = None  # stored for evidence pack ids
         self._calibration_report: Any = None  # R4: calibration report with actions
         self._calibrated_historical_threshold: float = 50.0  # 校准反馈闭环：调整后的阈值
+        self._calibrated_calibrator_params: Optional[Dict[str, float]] = None  # Path C: 校准后的 calibrator 参数
 
         # 构建阶段序列（支持 Skill 注册额外阶段）/ Build phase sequence (supports Skill extra phases)
         self._phases = self._build_phase_sequence(extra_phases)
@@ -536,6 +537,7 @@ class SimulationRuntime:
         self._run_id = run_id
         # 重置每次模拟的校准阈值，防止前次运行的阈值泄漏
         self._calibrated_historical_threshold = 50.0
+        self._calibrated_calibrator_params = None
         logger.info(f"[{run_id}] 开始模拟")
 
         # Job-level timeout: wrap entire simulation in asyncio.wait_for
@@ -1514,8 +1516,11 @@ class SimulationRuntime:
             return None
 
         try:
-            from ripple.providers.historical_calibrator import HistoricalCalibrator, apply_calibration_feedback
-            calibrator = HistoricalCalibrator()
+            from ripple.providers.historical_calibrator import (
+                HistoricalCalibrator,
+                apply_calibration_feedback,
+                apply_calibrator_feedback,
+            )
 
             # Build bucket context from simulation input
             bucket_context = {}
@@ -1531,6 +1536,19 @@ class SimulationRuntime:
             )
             # 存储校准阈值供 _evaluate_confidence_gate 使用
             self._calibrated_historical_threshold = calibrated_threshold
+
+            # Path C 闭环：获取调整后的 threshold 和 p95_hard_cap
+            calibrator_params = apply_calibrator_feedback(
+                bucket_context=bucket_context or None,
+                default_threshold=100.0,
+                default_p95_hard_cap=200.0,
+            )
+            self._calibrated_calibrator_params = calibrator_params
+
+            calibrator = HistoricalCalibrator(
+                threshold=calibrator_params.get("threshold", 100.0),
+                p95_hard_cap=calibrator_params.get("p95_hard_cap", 200.0),
+            )
 
             report = calibrator.calibrate(
                 synthesize_result.get("prediction", {}),
