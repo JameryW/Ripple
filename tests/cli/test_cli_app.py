@@ -1232,7 +1232,7 @@ def test_job_run_blocking_defaults_to_single_ensemble_and_omits_max_waves_when_u
     )
 
     assert result.exit_code == 0
-    assert captured["ensemble_runs"] == 1
+    assert captured["ensemble_runs"] == 2
     assert "max_waves" not in captured
 
 

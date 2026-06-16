@@ -1,0 +1,27 @@
+{
+  "nodes": [
+    {"id": "star_1", "type": "star", "platform": "xiaohongshu", "follower_count": 85000, "niche": "fashion"},
+    {"id": "star_2", "type": "star", "platform": "xiaohongshu", "follower_count": 120000, "niche": "beauty"},
+    {"id": "star_3", "type": "star", "platform": "weibo", "follower_count": 500000, "niche": "lifestyle"},
+    {"id": "star_4", "type": "star", "platform": "douyin", "follower_count": 350000, "niche": "food"},
+    {"id": "sea_1", "type": "sea", "platform": "xiaohongshu", "follower_count": 500},
+    {"id": "sea_2", "type": "sea", "platform": "xiaohongshu", "follower_count": 800},
+    {"id": "sea_3", "type": "sea", "platform": "weibo", "follower_count": 300},
+    {"id": "sea_4", "type": "sea", "platform": "weibo", "follower_count": 600},
+    {"id": "sea_5", "type": "sea", "platform": "douyin", "follower_count": 1200},
+    {"id": "sea_6", "type": "sea", "platform": "douyin", "follower_count": 400}
+  ],
+  "edges": [
+    {"source": "star_1", "target": "sea_1", "weight": 0.8},
+    {"source": "star_1", "target": "sea_2", "weight": 0.6},
+    {"source": "star_2", "target": "sea_1", "weight": 0.7},
+    {"source": "star_2", "target": "sea_2", "weight": 0.9},
+    {"source": "star_3", "target": "sea_3", "weight": 0.5},
+    {"source": "star_3", "target": "sea_4", "weight": 0.7},
+    {"source": "star_4", "target": "sea_5", "weight": 0.8},
+    {"source": "star_4", "target": "sea_6", "weight": 0.6},
+    {"source": "star_1", "target": "star_2", "weight": 0.3},
+    {"source": "sea_1", "target": "sea_2", "weight": 0.4},
+    {"source": "sea_3", "target": "sea_4", "weight": 0.3}
+  ]
+}
