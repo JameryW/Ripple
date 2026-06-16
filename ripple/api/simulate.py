@@ -460,6 +460,7 @@ async def simulate(
                 else "1=very weak, 2=weak, 3=moderate, 4=strong, 5=very strong",
                 max_rounds=deliberation_rounds,
                 system_prompt=tribunal_system,
+                skill_prompt=tribunal_prompt,
                 on_progress=_on_deliberation_progress,
             )
 
