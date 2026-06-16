@@ -6,6 +6,7 @@ dual-gate convergence (threshold + round limit).
 
 import json
 import logging
+from collections import Counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ripple.agents.tribunal import TribunalAgent
@@ -44,6 +45,7 @@ class DeliberationOrchestrator:
         rubric: str,
         max_rounds: int = 4,
         system_prompt: str = "",
+        skill_prompt: str = "",
         on_progress: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ):
         self.members = members
@@ -60,6 +62,7 @@ class DeliberationOrchestrator:
                 expertise=m.expertise,
                 llm_caller=llm_caller,
                 system_prompt=system_prompt,
+                skill_prompt=skill_prompt,
             )
             for m in members
         ]
@@ -223,18 +226,15 @@ class DeliberationOrchestrator:
         """R6: Aggregate audit fields from all tribunal agents' most recent LLM responses.
 
         Collects key_evidence, uncertainties, optimism_audit, overrated_dimensions,
-        missing_evidence from all agents, and takes the most conservative
-        recommended_confidence_cap (lowest).
+        missing_evidence from all agents, and aggregates recommended_confidence_cap
+        using majority vote (ties resolved conservatively — lower cap wins).
         """
         all_key_evidence: List[str] = []
         all_uncertainties: List[str] = []
         all_optimism_audit: List[str] = []
         all_overrated_dimensions: List[str] = []
         all_missing_evidence: List[str] = []
-        cap: Optional[str] = None
-
-        # Confidence cap ranking: low < medium < high
-        _cap_rank = {"low": 0, "medium": 1, "high": 2}
+        caps: List[str] = []
 
         for agent in self._agents:
             audit = getattr(agent, "_last_audit", {})
@@ -246,11 +246,19 @@ class DeliberationOrchestrator:
             all_overrated_dimensions.extend(audit.get("overrated_dimensions", []))
             all_missing_evidence.extend(audit.get("missing_evidence", []))
 
-            # Take the most conservative (lowest) confidence cap
             agent_cap = audit.get("recommended_confidence_cap")
             if agent_cap is not None:
-                if cap is None or _cap_rank.get(agent_cap, 1) < _cap_rank.get(cap, 1):
-                    cap = agent_cap
+                caps.append(str(agent_cap).strip().lower())
+
+        # Majority vote: pick the most frequent cap; ties → lowest (conservative)
+        _cap_rank = {"low": 0, "medium": 1, "high": 2}
+        cap: Optional[str] = None
+        if caps:
+            counts = Counter(caps)
+            max_count = max(counts.values())
+            # Filter to ties, then pick the one with lowest rank (conservative)
+            tied = [c for c, cnt in counts.items() if cnt == max_count]
+            cap = min(tied, key=lambda c: _cap_rank.get(c, 1))
 
         return {
             "key_evidence": all_key_evidence,

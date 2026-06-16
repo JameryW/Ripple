@@ -493,11 +493,18 @@ class ConfidenceGate:
             threshold_pct=historical_threshold_pct,
         ))
 
-        # Factor 4: Evidence balance
+        # Factor 4: Evidence balance (positive/negative ratio)
         factors.append(self._check_evidence_balance(
             positive=evidence_positive_count,
             negative=evidence_negative_count,
             silent=evidence_silent_count,
+        ))
+
+        # Factor 4b: Evidence silent ratio
+        total_evidence = evidence_positive_count + evidence_negative_count + evidence_silent_count
+        factors.append(self._check_evidence_silent(
+            silent=evidence_silent_count,
+            total=total_evidence,
         ))
 
         # Factor 5: Tribunal recommended confidence cap (R6)
@@ -645,31 +652,77 @@ class ConfidenceGate:
                 passed=True,
             )
 
-        # If positive signals dominate heavily (>80% of non-silent) with few negative
+        # --- Positive-signal ratio: gradient response ---
+        # Higher positive ratio = more supporting evidence = higher confidence.
+        # >95% positive → HIGH, 85-95% → MEDIUM, <85% → LOW
         non_silent = positive + negative
         if non_silent > 0:
             positive_ratio = positive / non_silent
-            if positive_ratio > 0.9 and negative < 2:
+            if positive_ratio > 0.95:
+                return ConfidenceFactor(
+                    name="evidence_balance",
+                    level=ConfidenceLevel.HIGH,
+                    reason=f"Strong positive evidence: {positive} positive vs {negative} negative",
+                    passed=True,
+                )
+            if positive_ratio > 0.85:
                 return ConfidenceFactor(
                     name="evidence_balance",
                     level=ConfidenceLevel.MEDIUM,
-                    reason=f"Evidence imbalanced: {positive} positive vs {negative} negative",
+                    reason=f"Moderate positive evidence: {positive} positive vs {negative} negative",
                     passed=False,
                 )
-
-        # If silent signals dominate (>70% of total)
-        if total > 5 and silent / total > 0.7:
             return ConfidenceFactor(
                 name="evidence_balance",
+                level=ConfidenceLevel.LOW,
+                reason=f"Weak positive evidence: {positive} positive vs {negative} negative",
+                passed=False,
+            )
+
+        # All silent — no positive or negative signals
+        return ConfidenceFactor(
+            name="evidence_balance",
+            level=ConfidenceLevel.MEDIUM,
+            reason="Only silent signals, no positive or negative evidence",
+            passed=False,
+        )
+
+    @staticmethod
+    def _check_evidence_silent(
+        silent: int,
+        total: int,
+    ) -> ConfidenceFactor:
+        """Check silent-signal dominance: gradient response.
+
+        >85% silent → LOW, 70-85% → MEDIUM, <70% → HIGH.
+        Called separately from _check_evidence_balance so both checks are independent.
+        """
+        if total == 0 or total <= 5:
+            return ConfidenceFactor(
+                name="evidence_silent",
+                level=ConfidenceLevel.HIGH,
+                reason="Silent ratio not evaluated (too few signals)",
+                passed=True,
+            )
+        silent_ratio = silent / total
+        if silent_ratio > 0.85:
+            return ConfidenceFactor(
+                name="evidence_silent",
+                level=ConfidenceLevel.LOW,
+                reason=f"Very high silent ratio: {silent}/{total} signals are silent/low-energy",
+                passed=False,
+            )
+        if silent_ratio > 0.70:
+            return ConfidenceFactor(
+                name="evidence_silent",
                 level=ConfidenceLevel.MEDIUM,
                 reason=f"High silent ratio: {silent}/{total} signals are silent/low-energy",
                 passed=False,
             )
-
         return ConfidenceFactor(
-            name="evidence_balance",
+            name="evidence_silent",
             level=ConfidenceLevel.HIGH,
-            reason=f"Balanced evidence: +{positive} -{negative} ~{silent}",
+            reason=f"Acceptable silent ratio: {silent}/{total}",
             passed=True,
         )
 

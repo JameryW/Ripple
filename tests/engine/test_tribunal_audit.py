@@ -317,7 +317,7 @@ class TestTribunalAgentAuditExtraction:
     async def test_revise_extracts_audit(self):
         """TribunalAgent.revise populates _last_audit from LLM response."""
         from ripple.agents.tribunal import TribunalAgent
-        from ripple.primitives.pmf_models import TribunalOpinion
+        from ripple.primitives.pmf_models import TribunalOpinion as TO
 
         mock_llm = AsyncMock(return_value=json.dumps({
             "scores": {"demand_resonance": 2},
@@ -337,7 +337,7 @@ class TestTribunalAgentAuditExtraction:
             expertise="Risk analysis",
             llm_caller=mock_llm,
         )
-        original = TribunalOpinion(
+        original = TO(
             member_role="DA",
             scores={"demand_resonance": 3},
             narrative="Original.",
@@ -711,3 +711,257 @@ class TestConfidenceGateTribunalCapFallback:
         parsed = runtime._parse_tribunal_audit()
         assert parsed is not None
         assert parsed["recommended_confidence_cap"] == "low"
+
+
+# ---------------------------------------------------------------------------
+# Majority vote for tribunal confidence cap
+# ---------------------------------------------------------------------------
+
+
+class TestMajorityVoteConfidenceCap:
+    """Tests for majority vote aggregation in _aggregate_audit_from_agents."""
+
+    def _make_orchestrator(self, agent_caps):
+        """Create a DeliberationOrchestrator with mock agents having given caps.
+
+        Args:
+            agent_caps: list of (cap_value_or_None) for each agent.
+        """
+        from ripple.engine.deliberation import DeliberationOrchestrator
+        from ripple.primitives.pmf_models import TribunalMember
+
+        mock_llm = AsyncMock()
+        members = [
+            TribunalMember(role=f"role_{i}", perspective="test", expertise="test")
+            for i in range(len(agent_caps))
+        ]
+        orch = DeliberationOrchestrator(
+            members=members,
+            llm_caller=mock_llm,
+            dimensions=["test"],
+            rubric="1-5",
+        )
+        # Set _last_audit on each agent
+        for i, cap in enumerate(agent_caps):
+            orch._agents[i]._last_audit = {
+                "key_evidence": [],
+                "uncertainties": [],
+                "optimism_audit": [],
+                "overrated_dimensions": [],
+                "missing_evidence": [],
+                "recommended_confidence_cap": cap,
+            }
+        return orch
+
+    def test_majority_medium_wins(self):
+        """[LOW, MEDIUM, MEDIUM] → MEDIUM (majority wins)."""
+        orch = self._make_orchestrator(["low", "medium", "medium"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "medium"
+
+    def test_majority_low_wins(self):
+        """[LOW, LOW, HIGH] → LOW (majority wins)."""
+        orch = self._make_orchestrator(["low", "low", "high"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "low"
+
+    def test_all_same_cap(self):
+        """[HIGH, HIGH, HIGH] → HIGH (unanimous)."""
+        orch = self._make_orchestrator(["high", "high", "high"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "high"
+
+    def test_tie_conservative_low(self):
+        """[LOW, MEDIUM, HIGH] → LOW (tie → conservative/lowest)."""
+        orch = self._make_orchestrator(["low", "medium", "high"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "low"
+
+    def test_all_none_cap(self):
+        """[None, None, None] → None (no caps recommended)."""
+        orch = self._make_orchestrator([None, None, None])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] is None
+
+    def test_mixed_none_and_values(self):
+        """[None, 'medium', 'medium'] → MEDIUM (majority of non-None)."""
+        orch = self._make_orchestrator([None, "medium", "medium"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "medium"
+
+    def test_single_cap_is_majority(self):
+        """[None, None, 'low'] → LOW (only one cap = majority of available)."""
+        orch = self._make_orchestrator([None, None, "low"])
+        result = orch._aggregate_audit_from_agents()
+        assert result["recommended_confidence_cap"] == "low"
+
+    def test_audits_aggregated_across_agents(self):
+        """key_evidence from all agents are collected."""
+        orch = self._make_orchestrator(["medium", "medium", "low"])
+        orch._agents[0]._last_audit["key_evidence"] = ["ev1"]
+        orch._agents[1]._last_audit["key_evidence"] = ["ev2"]
+        orch._agents[2]._last_audit["key_evidence"] = ["ev3"]
+        result = orch._aggregate_audit_from_agents()
+        assert result["key_evidence"] == ["ev1", "ev2", "ev3"]
+
+
+# ---------------------------------------------------------------------------
+# TribunalAgent skill_prompt injection tests
+# ---------------------------------------------------------------------------
+
+
+class TestTribunalAgentSkillPrompt:
+    """Tests for TribunalAgent skill_prompt parameter injection."""
+
+    @pytest.mark.asyncio
+    async def test_skill_prompt_in_evaluate(self):
+        """skill_prompt content appears in evaluate prompt."""
+        from ripple.agents.tribunal import TribunalAgent
+
+        captured_prompt = None
+
+        async def mock_caller(system_prompt="", user_prompt=""):
+            nonlocal captured_prompt
+            captured_prompt = user_prompt
+            return json.dumps({
+                "scores": {"test": 3},
+                "narrative": "ok",
+                "audit": {
+                    "key_evidence": [],
+                    "uncertainties": [],
+                    "optimism_audit": [],
+                    "overrated_dimensions": [],
+                    "missing_evidence": [],
+                    "recommended_confidence_cap": None,
+                },
+            })
+
+        agent = TribunalAgent(
+            role="Analyst",
+            perspective="Test",
+            expertise="Testing",
+            llm_caller=mock_caller,
+            skill_prompt="Custom skill guidance for evaluation",
+        )
+        await agent.evaluate(
+            evidence="Test evidence",
+            dimensions=["test"],
+            rubric="1-5",
+        )
+        assert captured_prompt is not None
+        assert "Custom skill guidance for evaluation" in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_no_skill_prompt_backward_compat(self):
+        """Without skill_prompt, evaluate prompt works as before."""
+        from ripple.agents.tribunal import TribunalAgent
+
+        captured_prompt = None
+
+        async def mock_caller(system_prompt="", user_prompt=""):
+            nonlocal captured_prompt
+            captured_prompt = user_prompt
+            return json.dumps({
+                "scores": {"test": 3},
+                "narrative": "ok",
+                "audit": {
+                    "key_evidence": [],
+                    "uncertainties": [],
+                    "optimism_audit": [],
+                    "overrated_dimensions": [],
+                    "missing_evidence": [],
+                    "recommended_confidence_cap": None,
+                },
+            })
+
+        agent = TribunalAgent(
+            role="Analyst",
+            perspective="Test",
+            expertise="Testing",
+            llm_caller=mock_caller,
+        )
+        await agent.evaluate(
+            evidence="Test evidence",
+            dimensions=["test"],
+            rubric="1-5",
+        )
+        assert captured_prompt is not None
+        assert "## Skill Context" not in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_skill_prompt_in_revise(self):
+        """skill_prompt content appears in revise prompt."""
+        from ripple.agents.tribunal import TribunalAgent
+        from ripple.primitives.pmf_models import TribunalOpinion as TO
+
+        captured_prompt = None
+
+        async def mock_caller(system_prompt="", user_prompt=""):
+            nonlocal captured_prompt
+            captured_prompt = user_prompt
+            return json.dumps({
+                "scores": {"test": 4},
+                "narrative": "revised",
+                "audit": {
+                    "key_evidence": [],
+                    "uncertainties": [],
+                    "optimism_audit": [],
+                    "overrated_dimensions": [],
+                    "missing_evidence": [],
+                    "recommended_confidence_cap": None,
+                },
+            })
+
+        agent = TribunalAgent(
+            role="DA",
+            perspective="Risk",
+            expertise="Risk analysis",
+            llm_caller=mock_caller,
+            skill_prompt="Risk-specific evaluation criteria",
+        )
+        original = TO(
+            member_role="DA",
+            scores={"test": 3},
+            narrative="Original.",
+            round_number=0,
+        )
+        await agent.revise(original, ["Challenge 1"], round_number=1)
+        assert captured_prompt is not None
+        assert "Risk-specific evaluation criteria" in captured_prompt
+
+    def test_deliberation_orchestrator_passes_skill_prompt(self):
+        """DeliberationOrchestrator passes skill_prompt to all agents."""
+        from ripple.engine.deliberation import DeliberationOrchestrator
+        from ripple.primitives.pmf_models import TribunalMember
+
+        mock_llm = AsyncMock()
+        members = [
+            TribunalMember(role="role_0", perspective="test", expertise="test"),
+            TribunalMember(role="role_1", perspective="test", expertise="test"),
+        ]
+        orch = DeliberationOrchestrator(
+            members=members,
+            llm_caller=mock_llm,
+            dimensions=["test"],
+            rubric="1-5",
+            skill_prompt="Test skill context",
+        )
+        for agent in orch._agents:
+            assert agent._skill_prompt == "Test skill context"
+
+    def test_deliberation_orchestrator_no_skill_prompt_default(self):
+        """DeliberationOrchestrator without skill_prompt uses empty string."""
+        from ripple.engine.deliberation import DeliberationOrchestrator
+        from ripple.primitives.pmf_models import TribunalMember
+
+        mock_llm = AsyncMock()
+        members = [
+            TribunalMember(role="role_0", perspective="test", expertise="test"),
+        ]
+        orch = DeliberationOrchestrator(
+            members=members,
+            llm_caller=mock_llm,
+            dimensions=["test"],
+            rubric="1-5",
+        )
+        assert orch._agents[0]._skill_prompt == ""

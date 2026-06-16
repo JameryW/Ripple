@@ -221,18 +221,54 @@ class TestConfidenceGate:
         assert r.final_confidence == ConfidenceLevel.MEDIUM
         assert r.gate_applied
 
-    def test_evidence_imbalance(self):
-        r = self.gate.evaluate("high", evidence_positive_count=20, evidence_negative_count=1, evidence_silent_count=0)
+    def test_evidence_strong_positive(self):
+        """96% positive ratio → HIGH (strong supporting evidence)."""
+        r = self.gate.evaluate("high", evidence_positive_count=24, evidence_negative_count=1, evidence_silent_count=0)
+        assert r.final_confidence == ConfidenceLevel.HIGH
+        assert not r.gate_applied
+
+    def test_evidence_moderate_positive(self):
+        """90% positive ratio → MEDIUM (moderate supporting evidence)."""
+        r = self.gate.evaluate("high", evidence_positive_count=18, evidence_negative_count=2, evidence_silent_count=0)
         assert r.final_confidence == ConfidenceLevel.MEDIUM
         assert r.gate_applied
 
-    def test_high_silent_ratio(self):
-        r = self.gate.evaluate("high", evidence_positive_count=1, evidence_negative_count=1, evidence_silent_count=10)
-        assert r.final_confidence == ConfidenceLevel.MEDIUM
+    def test_evidence_weak_positive(self):
+        """80% positive ratio → LOW (weak supporting evidence)."""
+        r = self.gate.evaluate("high", evidence_positive_count=16, evidence_negative_count=4, evidence_silent_count=0)
+        assert r.final_confidence == ConfidenceLevel.LOW
+        assert r.gate_applied
 
-    def test_balanced_evidence(self):
-        r = self.gate.evaluate("high", evidence_positive_count=5, evidence_negative_count=3, evidence_silent_count=2)
+    def test_high_silent_ratio_low(self):
+        """86% silent ratio → LOW (very high silent dominance)."""
+        r = self.gate.evaluate("high", evidence_positive_count=1, evidence_negative_count=0, evidence_silent_count=7)
+        # positive_ratio = 100% → HIGH (evidence_balance), but silent_ratio = 87.5% > 85% → LOW (evidence_silent)
+        assert r.final_confidence == ConfidenceLevel.LOW
+
+    def test_moderate_silent_ratio(self):
+        """75% silent ratio → MEDIUM (high silent ratio)."""
+        r = self.gate.evaluate("high", evidence_positive_count=1, evidence_negative_count=1, evidence_silent_count=6)
+        # positive_ratio = 50% → LOW (evidence_balance), but silent_ratio = 75% → MEDIUM (evidence_silent)
+        # min(LOW, MEDIUM) = LOW
+        assert r.final_confidence == ConfidenceLevel.LOW
+
+    def test_balanced_evidence_mixed_signals(self):
+        """70%+ positive ratio with some negative → LOW (below 85% threshold)."""
+        r = self.gate.evaluate("high", evidence_positive_count=7, evidence_negative_count=3, evidence_silent_count=0)
+        # positive_ratio = 70% < 85% → LOW (evidence_balance)
+        assert r.final_confidence == ConfidenceLevel.LOW
+        assert r.gate_applied
+
+    def test_evidence_no_signals(self):
+        """No evidence signals → HIGH (neutral, no gate)."""
+        r = self.gate.evaluate("high", evidence_positive_count=0, evidence_negative_count=0, evidence_silent_count=0)
         assert not r.gate_applied
+
+    def test_evidence_all_silent(self):
+        """Only silent signals → MEDIUM (no positive or negative evidence)."""
+        r = self.gate.evaluate("high", evidence_positive_count=0, evidence_negative_count=0, evidence_silent_count=5)
+        # non_silent = 0 → all silent path → MEDIUM
+        assert r.final_confidence == ConfidenceLevel.MEDIUM
 
     def test_single_run_no_ensemble_data(self):
         r = self.gate.evaluate("high")
@@ -245,7 +281,7 @@ class TestConfidenceGate:
         assert r.gate_applied
 
     def test_multiple_gates_stack(self):
-        # Provider missing + evidence imbalance → medium (provider caps, evidence also caps)
+        # Provider missing + strong positive evidence → medium (provider caps)
         r = self.gate.evaluate(
             "high",
             provider_available=False,
