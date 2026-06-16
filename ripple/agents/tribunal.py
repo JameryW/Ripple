@@ -177,6 +177,23 @@ class TribunalAgent:
             f"## Dimensions to evaluate\n{', '.join(dimensions)}\n\n"
             'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "your analysis"}'
             + audit_instruction
+            + (
+                "\n\n## Evaluation Guidance\n"
+                "- Base your confidence cap on the **strength and diversity of evidence**, not just its absence. "
+                "Having only positive signals is not necessarily a reason for low confidence — "
+                "it may indicate strong support.\n"
+                "- If historical data shows similar content performing well, this is positive evidence "
+                "that should **increase** your confidence, not just serve as a comparison baseline.\n"
+                "- Do **not** default to LOW cap merely because some evidence is missing or the simulation "
+                "is a prediction. Predictions are inherently uncertain — cap based on whether the available "
+                "evidence is **sufficiently diverse and consistent** to support the claimed outcome.\n"
+                "- A HIGH cap is appropriate when: evidence is diverse (positive + some negative), "
+                "consistent across dimensions, and aligned with historical patterns.\n"
+                "- A MEDIUM cap is appropriate when: evidence is mostly positive but limited in diversity, "
+                "or there are moderate uncertainties.\n"
+                "- A LOW cap is appropriate when: evidence is contradictory, key dimensions lack support, "
+                "or historical data strongly contradicts the prediction.\n"
+            )
         )
         last_error = None
         for attempt in range(1 + self._max_retries):
@@ -270,6 +287,9 @@ class TribunalAgent:
             f"Narrative: {original_opinion.narrative}\n\n"
             f"Challenges received:\n{challenges_text}\n\n"
             "Revise your assessment. You may keep, raise, or lower scores.\n"
+            "**Convergence guidance**: If the challenges do not provide new evidence or "
+            "persuasive reasoning that contradicts your assessment, maintain your current "
+            "confidence cap. Only change your cap when presented with substantive new information.\n"
             'Respond with JSON: {"scores": {dimension: 1-5}, "narrative": "revised analysis"}'
             + audit_instruction
         )
