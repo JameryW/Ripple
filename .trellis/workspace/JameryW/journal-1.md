@@ -307,3 +307,36 @@ Implemented full backtest feedback loop (Path C): SQLite persistence (BacktestSt
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: Refine ConfidenceGate: majority vote, gradient evidence balance, skill_prompt
+
+**Date**: 2026-06-16
+**Task**: Refine ConfidenceGate: majority vote, gradient evidence balance, skill_prompt
+**Branch**: `feat/refine-confidence-gate-tribunal-cap-and-evidence-balance`
+
+### Summary
+
+Optimized ConfidenceGate: tribunal cap from min to majority vote, evidence_balance from binary to 3-level gradient, TribunalAgent skill_prompt injection. 880 tests pass. PR #13.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1d91187` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
